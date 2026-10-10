@@ -1,0 +1,10 @@
+import type { displayChart } from '@insight/shared/tools';
+
+import { Block } from '../../lib/markdown';
+
+export function DisplayChartOutput({ output }: { output: displayChart.Output }) {
+	if (output.error) {
+		return <Block>Could not display the visualization: {output.error}</Block>;
+	}
+	return <Block>Visualization displayed successfully.</Block>;
+}

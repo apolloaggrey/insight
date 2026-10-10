@@ -1,0 +1,587 @@
+from __future__ import annotations
+
+from enum import Enum
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
+
+import questionary
+from pydantic import BaseModel, Field, model_validator
+
+from insight_core.config.exceptions import InitError
+from insight_core.ui import ask_confirm, ask_select, ask_text
+
+if TYPE_CHECKING:
+    import pandas as pd
+    from ibis import BaseBackend
+
+from .base import DatabaseConfig
+from .context import DatabaseContext
+
+
+class RedshiftAuthMode(str, Enum):
+    PASSWORD = "password"
+    IAM = "iam"
+    AZURE_ENTRA_ID = "azure_entra_id"
+
+
+class RedshiftDatabaseContext(DatabaseContext):
+    """Redshift-specific context that bypasses Ibis's problematic pg_enum queries."""
+
+    def columns(self) -> list[dict[str, Any]]:
+        if self._columns_cache is None:
+            col_descs = self._fetch_column_descriptions()
+            query = f"""
+                SELECT
+                    column_name, data_type, is_nullable,
+                    character_maximum_length, numeric_precision, numeric_scale
+                FROM information_schema.columns
+                WHERE table_schema = '{self._schema}'
+                AND table_name = '{self._table_name}'
+                ORDER BY ordinal_position
+            """
+            result = self._fetchall(self._conn.raw_sql(query))  # type: ignore[union-attr]
+            self._columns_cache = [
+                {
+                    "name": row[0],
+                    "type": self._format_redshift_type(row[1], row[2] == "YES", row[3], row[4], row[5]),
+                    "nullable": row[2] == "YES",
+                    "description": col_descs.get(row[0]),
+                }
+                for row in result
+            ]
+        return self._filter_excluded_columns(self._columns_cache)
+
+    def clustering_columns(self) -> list[str]:
+        try:
+            return self._filter_excluded_names(
+                _get_redshift_sortkey_columns(self._conn, self._schema, self._table_name)
+            )
+        except Exception:
+            return []
+
+    def row_count(self) -> int:
+        if self._row_count_cache is None:
+            schema_sql = self._quote(self._schema)
+            table_sql = self._quote(self._table_name)
+            result = self._fetchone(self._conn.raw_sql(f"SELECT COUNT(*) FROM {schema_sql}.{table_sql}"))  # type: ignore[union-attr]
+            self._row_count_cache = int(result[0]) if result else 0
+        return self._row_count_cache
+
+    @staticmethod
+    def _format_redshift_type(
+        data_type: str,
+        is_nullable: bool,
+        char_length: int | None,
+        num_precision: int | None,
+        num_scale: int | None,
+    ) -> str:
+        """Convert Redshift SQL type to Ibis-like format."""
+        # Map common Redshift types to Ibis types
+        type_map = {
+            "integer": "int32",
+            "bigint": "int64",
+            "smallint": "int16",
+            "boolean": "boolean",
+            "real": "float32",
+            "double precision": "float64",
+            "character varying": "string",
+            "character": "string",
+            "text": "string",
+            "date": "date",
+            "timestamp without time zone": "timestamp",
+            "timestamp with time zone": "timestamp",
+            "super": "super",
+        }
+
+        ibis_type = type_map.get(data_type, "string")
+
+        if not is_nullable:
+            return f"{ibis_type} NOT NULL"
+        return ibis_type
+
+    def preview(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Return the first N rows as a list of dictionaries."""
+        # Use raw SQL to avoid Ibis's pg_enum queries
+        schema_sql = self._quote(self._schema)
+        table_sql = self._quote(self._table_name)
+        limit = int(limit)
+        query = f"SELECT * FROM {schema_sql}.{table_sql} LIMIT {limit}"
+        result = self._conn.raw_sql(query).fetchall()  # type: ignore[union-attr]
+
+        # Use the unfiltered column metadata so row indices stay aligned with
+        # SELECT * output; the excluded columns are dropped after the dict is built.
+        if self._columns_cache is None:
+            self.columns()
+        col_names = [col["name"] for col in (self._columns_cache or [])]
+
+        rows = []
+        for row in result:
+            row_dict = {}
+            for i, col_name in enumerate(col_names):
+                val = row[i] if i < len(row) else None
+                if val is not None and not isinstance(val, (str, int, float, bool, list, dict)):
+                    row_dict[col_name] = str(val)
+                else:
+                    row_dict[col_name] = val
+            rows.append(self._filter_excluded_row(row_dict))
+        return rows
+
+    def _fetch_column_descriptions(self) -> dict[str, str]:
+        """Fetch column descriptions from pg_catalog."""
+        try:
+            query = f"""
+                SELECT a.attname, d.description
+                FROM pg_catalog.pg_description d
+                JOIN pg_catalog.pg_class c ON c.oid = d.objoid
+                JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = '{_quote_literal(self._schema)}' AND c.relname = '{_quote_literal(self._table_name)}' AND d.objsubid > 0
+            """
+            rows = self._conn.raw_sql(query).fetchall()  # type: ignore[union-attr]
+            return {row[0]: str(row[1]) for row in rows if row[1]}
+        except Exception:
+            return {}
+
+    def description(self) -> str | None:
+        """Return the table description from pg_catalog."""
+        try:
+            query = f"""
+                SELECT d.description
+                FROM pg_catalog.pg_description d
+                JOIN pg_catalog.pg_class c ON c.oid = d.objoid
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = '{_quote_literal(self._schema)}' AND c.relname = '{_quote_literal(self._table_name)}' AND d.objsubid = 0
+            """
+            row = self._conn.raw_sql(query).fetchone()  # type: ignore[union-attr]
+            if row and row[0]:
+                return str(row[0]).strip() or None
+        except Exception:
+            pass
+        return None
+
+    def _cast_float(self, expr: str) -> str:
+        return f"{expr}::float"
+
+    def _cast_complex_to_string(self, col_sql: str) -> str:
+        return f"JSON_SERIALIZE({col_sql})"
+
+
+def _quote_literal(value: str) -> str:
+    """Escape a value for safe use inside a SQL string literal."""
+    return value.replace("'", "''")
+
+
+def _get_redshift_sortkey_columns(conn: BaseBackend, schema: str, table: str) -> list[str]:
+    """Return SORTKEY columns for a Redshift table, ordered by sort position."""
+    schema_literal = _quote_literal(schema)
+    table_literal = _quote_literal(table)
+    query = f"""
+        SELECT a.attname
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = '{schema_literal}'
+          AND c.relname = '{table_literal}'
+          AND a.attsortkeyord > 0
+        ORDER BY a.attsortkeyord
+    """
+    result = conn.raw_sql(query).fetchall()  # type: ignore[union-attr]
+    return [row[0] for row in result]
+
+
+class RedshiftSSHTunnelConfig(BaseModel):
+    """SSH tunnel configuration for Redshift connection."""
+
+    ssh_host: str = Field(description="SSH host")
+    ssh_port: int = Field(default=22, description="SSH port")
+    ssh_username: str = Field(description="SSH username")
+    ssh_private_key_path: str = Field(description="Path to SSH private key file")
+    ssh_private_key_passphrase: str | None = Field(default=None, description="SSH private key passphrase (optional)")
+
+
+class RedshiftConfig(DatabaseConfig):
+    """Amazon Redshift-specific configuration."""
+
+    type: Literal["redshift"] = "redshift"
+    host: str = Field(description="Redshift cluster endpoint")
+    port: int = Field(default=5439, description="Redshift port")
+    database: str = Field(description="Database name")
+    auth_mode: RedshiftAuthMode = Field(default=RedshiftAuthMode.PASSWORD, description="Authentication mode")
+    user: str | None = Field(
+        default=None,
+        description=(
+            "Username. Required for password auth. In azure_entra_id mode it is optional "
+            "but recommended: insight sync uses it to read metadata (columns, previews, query history). "
+            "It is never used at runtime from /execute_sql."
+        ),
+    )
+    password: str | None = Field(
+        default=None,
+        description=(
+            "Password. Required for password auth. In azure_entra_id mode it is optional "
+            "but recommended: insight sync uses it to read metadata (columns, previews, query history). "
+            "It is never used at runtime from /execute_sql."
+        ),
+    )
+    schema_name: str | None = Field(default=None, description="Default schema (optional, uses 'public' if not set)")
+    sslmode: str = Field(default="require", description="SSL mode for the connection")
+    ssh_tunnel: RedshiftSSHTunnelConfig | None = Field(default=None, description="SSH tunnel configuration (optional)")
+
+    cluster_id: str | None = Field(
+        default=None,
+        description="Cluster identifier for get_cluster_credentials. Defaults to first segment of host when not set.",
+    )
+    region_name: str | None = Field(
+        default=None,
+        description="AWS region for IAM authentication (e.g. 'us-east-1'). Required when auth_mode is 'iam'.",
+    )
+    aws_access_key_id: str | None = Field(default=None, description="AWS access key ID")
+    aws_secret_access_key: str | None = Field(default=None, description="AWS secret access key")
+    aws_session_token: str | None = Field(default=None, description="AWS session token")
+    profile_name: str | None = Field(default=None, description="AWS profile name")
+
+    @model_validator(mode="after")
+    def validate_credentials(self) -> "RedshiftConfig":
+        if self.auth_mode == RedshiftAuthMode.PASSWORD:
+            if not self.user or not self.password:
+                raise ValueError("user and password are required when auth_mode is 'password'")
+        elif self.auth_mode == RedshiftAuthMode.IAM:
+            if not self.user:
+                raise ValueError("user is required when auth_mode is 'iam'")
+            if not self.region_name:
+                raise ValueError("region_name is required when auth_mode is 'iam'")
+            if bool(self.aws_access_key_id) != bool(self.aws_secret_access_key):
+                raise ValueError(
+                    "aws_access_key_id and aws_secret_access_key must be provided together when auth_mode is 'iam'"
+                )
+            if self.aws_session_token and not self.aws_access_key_id:
+                raise ValueError(
+                    "aws_session_token requires aws_access_key_id and aws_secret_access_key to also be provided"
+                )
+        return self
+
+    @classmethod
+    def promptConfig(cls) -> "RedshiftConfig":
+        """Interactively prompt the user for Redshift configuration."""
+        name = ask_text("Connection name:", default="redshift-prod") or "redshift-prod"
+        host = ask_text("Cluster endpoint (e.g., your-cluster.region.redshift.amazonaws.com):", required_field=True)
+        port_str = ask_text("Port:", default="5439") or "5439"
+
+        if not port_str.isdigit():
+            raise InitError("Port must be a valid integer.")
+
+        database = ask_text("Database name:", required_field=True)
+        user = ask_text("Username:", required_field=True)
+        sslmode = ask_text("SSL mode:", default="require") or "require"
+        schema_name = ask_text("Default schema (uses 'public' if empty):")
+
+        auth_mode = RedshiftAuthMode(
+            ask_select(
+                "Authentication method:",
+                choices=[
+                    questionary.Choice("Username / Password", value=RedshiftAuthMode.PASSWORD),
+                    questionary.Choice("IAM (temporary credentials via AWS)", value=RedshiftAuthMode.IAM),
+                    questionary.Choice("Azure Entra ID", value=RedshiftAuthMode.AZURE_ENTRA_ID),
+                ],
+            )
+        )
+
+        password: str | None = None
+        cluster_id: str | None = None
+        region_name: str | None = None
+        aws_access_key_id: str | None = None
+        aws_secret_access_key: str | None = None
+        aws_session_token: str | None = None
+        profile_name: str | None = None
+
+        if auth_mode == RedshiftAuthMode.PASSWORD:
+            password = ask_text("Password:", password=True, required_field=True)
+        elif auth_mode == RedshiftAuthMode.IAM:
+            cluster_id = ask_text("Cluster identifier (leave empty to derive from endpoint):") or None
+            region_name = ask_text("AWS region (e.g., us-east-1):", required_field=True) or ""
+
+            iam_source = ask_select(
+                "IAM credential source:",
+                choices=[
+                    questionary.Choice("AWS Profile", value="profile"),
+                    questionary.Choice("Access Keys", value="keys"),
+                    questionary.Choice("Default credential chain (env vars / instance role)", value="default"),
+                ],
+            )
+            if iam_source == "profile":
+                profile_name = ask_text("AWS Profile Name:", default="default")
+            elif iam_source == "keys":
+                aws_access_key_id = ask_text("AWS Access Key ID:", required_field=True)
+                aws_secret_access_key = ask_text("AWS Secret Access Key:", password=True, required_field=True)
+                aws_session_token = ask_text("AWS Session Token (optional):", password=True) or None
+
+        use_ssh = ask_confirm("Use SSH tunnel?", default=False)
+        ssh_tunnel = None
+
+        if use_ssh:
+            ssh_host = ask_text("SSH host:", required_field=True)
+            ssh_port_str = ask_text("SSH port:", default="22") or "22"
+
+            if not ssh_port_str.isdigit():
+                raise InitError("SSH port must be a valid integer.")
+
+            ssh_username = ask_text("SSH username:", required_field=True)
+            ssh_private_key_path = ask_text("Path to SSH private key:", required_field=True)
+            ssh_private_key_passphrase = ask_text("SSH private key passphrase (optional):", password=True)
+
+            ssh_tunnel = RedshiftSSHTunnelConfig(
+                ssh_host=ssh_host or "",
+                ssh_port=int(ssh_port_str),
+                ssh_username=ssh_username or "",
+                ssh_private_key_path=ssh_private_key_path or "",
+                ssh_private_key_passphrase=ssh_private_key_passphrase or None,
+            )
+
+        return RedshiftConfig(
+            name=name,
+            host=host or "",
+            port=int(port_str),
+            database=database or "",
+            auth_mode=auth_mode,
+            user=user or "",
+            password=password,
+            schema_name=schema_name,
+            sslmode=sslmode,
+            ssh_tunnel=ssh_tunnel,
+            cluster_id=cluster_id,
+            region_name=region_name,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            profile_name=profile_name,
+        )
+
+    def connect(self) -> BaseBackend:
+        """Create an Ibis Redshift connection using user/password credentials.
+
+        Used by insight sync to gather context (metadata, previews, query history).
+        Works for both auth modes whenever user/password are provided; in iam
+        mode credentials are exchanged via boto3 get_cluster_credentials() instead.
+        In azure_entra_id mode the credentials are sync-only and must never be
+        used to serve runtime queries from /execute_sql.
+        """
+        if self.auth_mode == RedshiftAuthMode.IAM:
+            db_user, db_password = self._get_iam_credentials()
+        elif self.user and self.password:
+            db_user, db_password = self.user, self.password
+        else:
+            raise RuntimeError(
+                f"Redshift connect() requires user and password. "
+                f"When auth_mode='{self.auth_mode.value}', provide them so insight sync "
+                f"can read metadata; they will not be used at runtime."
+            )
+
+        from insight_core.deps import require_database_backend
+
+        require_database_backend("postgres", extra="redshift", database_type="redshift")
+        import ibis
+
+        connect_host = self.host
+        connect_port = self.port
+
+        if self.ssh_tunnel:
+            from insight_core.deps import require_dependency
+
+            require_dependency("sshtunnel", "redshift", "for SSH tunnel connections")
+            from sshtunnel import SSHTunnelForwarder
+
+            ssh_pkey_path = Path(self.ssh_tunnel.ssh_private_key_path).expanduser()
+
+            tunnel = SSHTunnelForwarder(
+                (self.ssh_tunnel.ssh_host, self.ssh_tunnel.ssh_port),
+                ssh_username=self.ssh_tunnel.ssh_username,
+                ssh_pkey=str(ssh_pkey_path),
+                ssh_private_key_password=self.ssh_tunnel.ssh_private_key_passphrase,
+                remote_bind_address=(self.host, self.port),
+                local_bind_address=("127.0.0.1", 0),
+            )
+            tunnel.start()
+
+            connect_host = "127.0.0.1"
+            connect_port = tunnel.local_bind_port
+
+        kwargs: dict = {
+            "host": connect_host,
+            "port": connect_port,
+            "database": self.database,
+            "user": db_user,
+            "password": db_password,
+            "client_encoding": "utf8",
+            "sslmode": self.sslmode,
+        }
+
+        if self.schema_name:
+            kwargs["schema"] = self.schema_name
+
+        return ibis.postgres.connect(
+            **kwargs,
+        )
+
+    def _get_iam_credentials(self) -> tuple[str, str]:
+        from insight_core.deps import require_dependency
+
+        require_dependency("boto3", "redshift", "for Redshift IAM authentication")
+        import boto3
+
+        cluster_id = self.cluster_id or self.host.split(".")[0]
+
+        if self.profile_name:
+            session = boto3.Session(profile_name=self.profile_name, region_name=self.region_name)
+        elif self.aws_access_key_id and self.aws_secret_access_key:
+            session = boto3.Session(
+                aws_access_key_id=self.aws_access_key_id,
+                aws_secret_access_key=self.aws_secret_access_key,
+                aws_session_token=self.aws_session_token,
+                region_name=self.region_name,
+            )
+        else:
+            session = boto3.Session(region_name=self.region_name)
+
+        client = session.client("redshift")
+        response = client.get_cluster_credentials(
+            DbUser=self.user,
+            DbName=self.database,
+            ClusterIdentifier=cluster_id,
+            AutoCreate=False,
+        )
+        return response["DbUser"], response["DbPassword"]
+
+    def execute_sql(self, sql: str, conn: BaseBackend | None = None) -> pd.DataFrame:
+        """Execute SQL using user/password credentials.
+
+        Forbidden when auth_mode=azure_entra_id: runtime queries must flow
+        through execute_sql_with_token() with the end user's access token so
+        per-user identity is preserved on the warehouse.
+        """
+        if self.auth_mode == RedshiftAuthMode.AZURE_ENTRA_ID:
+            raise RuntimeError(
+                "execute_sql is not allowed when auth_mode='azure_entra_id'. "
+                "Use execute_sql_with_token() with the end user's access token instead."
+            )
+        return super().execute_sql(sql, conn=conn)
+
+    def execute_sql_with_token(
+        self,
+        sql: str,
+        access_token: str,
+        conn: Any | None = None,
+    ) -> pd.DataFrame:
+        """Execute SQL using a JWT access token for Azure Entra ID native IdP federation."""
+        import pandas as pd
+
+        owns_connection = conn is None
+        if conn is None:
+            from insight_core.deps import require_dependency
+
+            require_dependency("redshift_connector", "redshift", "for Redshift JWT authentication")
+            import redshift_connector
+
+            kwargs: dict = {
+                "iam": True,
+                "host": self.host,
+                "port": self.port,
+                "database": self.database,
+                "credentials_provider": "BasicJwtCredentialsProvider",
+                "web_identity_token": access_token,
+                "group_federation": True,
+                "ssl": True,
+            }
+
+            serverless_parts = self._parse_serverless_host()
+            if serverless_parts:
+                kwargs["serverless_work_group"] = serverless_parts["work_group"]
+                kwargs["serverless_acct_id"] = serverless_parts["acct_id"]
+
+            conn = redshift_connector.connect(**kwargs)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(sql)
+            if cursor.description is None:
+                return pd.DataFrame()
+            columns = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            return pd.DataFrame(rows, columns=columns)  # type: ignore[arg-type]
+        finally:
+            if owns_connection:
+                conn.close()
+
+    def _parse_serverless_host(self) -> dict[str, str] | None:
+        """Extract workgroup and account ID from a Redshift Serverless endpoint.
+        Format: <workgroup>.<acct-id>.<region>.redshift-serverless.amazonaws.com
+        """
+        if "redshift-serverless" not in self.host:
+            return None
+        parts = self.host.split(".")
+        if len(parts) >= 5:
+            return {"work_group": parts[0], "acct_id": parts[1]}
+        return None
+
+    def get_database_name(self) -> str:
+        """Get the database name for Redshift."""
+        return self.database
+
+    def get_schemas(self, conn: BaseBackend) -> list[str]:
+        """Get all schemas in the current database."""
+        if self.schema_name:
+            return [self.schema_name]
+
+        # svv_all_schemas includes schemas shared through Redshift datashares.
+        query = """
+            SELECT DISTINCT schema_name
+            FROM svv_all_schemas
+            WHERE schema_name NOT LIKE 'pg_%'
+              AND schema_name != 'information_schema'
+              AND database_name = current_database()
+            ORDER BY schema_name
+        """
+        try:
+            result = conn.raw_sql(query).fetchall()  # type: ignore[union-attr]
+            schemas = [row[0] for row in result]
+            return schemas
+        except Exception:
+            list_databases = getattr(conn, "list_databases", None)
+            return list_databases() if list_databases else ["public"]
+
+    def create_context(self, conn: BaseBackend, schema: str, table_name: str) -> RedshiftDatabaseContext:
+        """Create a Redshift-specific database context that avoids pg_enum queries."""
+        return RedshiftDatabaseContext(conn, schema, table_name)
+
+    def _default_query_history_sql(self, days: int) -> str | None:
+        return (
+            f"SELECT querytxt AS query_text "
+            f"FROM stl_query "
+            f"WHERE starttime >= DATEADD(day, -{days}, GETDATE()) "
+            f"AND aborted = 0 "
+            f"ORDER BY starttime DESC "
+            f"LIMIT 10000"
+        )
+
+    def check_connection(self) -> tuple[bool, str]:
+        """Test connectivity to Redshift."""
+        conn = None
+        try:
+            conn = self.connect()
+
+            if self.schema_name:
+                tables = conn.list_tables(database=self.schema_name)
+                return True, f"Connected successfully ({len(tables)} tables found)"
+
+            if self.database:
+                schemas = self.get_schemas(conn)
+
+                tables = []
+                for schema in schemas:
+                    tables.extend(conn.list_tables(database=schema))
+                return True, f"Connected successfully ({len(tables)} tables found)"
+
+            return True, "Connected successfully"
+        except Exception as e:
+            return False, str(e)
+        finally:
+            if conn is not None:
+                conn.disconnect()

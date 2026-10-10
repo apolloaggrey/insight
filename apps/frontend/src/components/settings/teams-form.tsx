@@ -1,0 +1,171 @@
+import { useState } from 'react';
+import { useForm } from '@tanstack/react-form';
+import JSZip from 'jszip';
+import { Button } from '@/components/ui/button';
+import { ErrorMessage } from '@/components/ui/error-message';
+import { getSubmitErrorMessage, PasswordField } from '@/components/ui/form-fields';
+
+export interface TeamsFormProps {
+	hasProjectConfig: boolean;
+	onSubmit: (values: { appId: string; appPassword: string; tenantId: string }) => Promise<void>;
+	onCancel: () => void;
+	isPending: boolean;
+	teamsRedirectUrl: string | undefined;
+}
+
+export function buildTeamsManifest(appId: string, redirectUrl: string) {
+	const url = new URL(redirectUrl);
+	const domain = url.hostname;
+
+	return {
+		$schema: 'https://developer.microsoft.com/json-schemas/teams/v1.16/MicrosoftTeams.schema.json',
+		manifestVersion: '1.16',
+		version: '1.0.0',
+		id: appId,
+		developer: {
+			name: 'Insight',
+			websiteUrl: `${url.origin}/`,
+			privacyUrl: `${url.origin}/`,
+			termsOfUseUrl: `${url.origin}/`,
+		},
+		name: { short: 'Insight', full: 'Insight' },
+		description: {
+			short: 'Analytics agent for data queries',
+			full: 'Analytics agent for data queries, providing insights and visualizations based on your data.',
+		},
+		icons: { outline: 'outline.png', color: 'color.png' },
+		accentColor: '#FFFFFF',
+		bots: [
+			{
+				botId: appId,
+				scopes: ['personal', 'team', 'groupChat'],
+				supportsFiles: true,
+				isNotificationOnly: false,
+			},
+		],
+		webApplicationInfo: {
+			id: appId,
+			resource: `api://${domain}/${appId}`,
+		},
+		permissions: ['identity', 'messageTeamMembers'],
+		authorization: {
+			permissions: {
+				resourceSpecific: [
+					{ name: 'ChannelMessage.Read.Group', type: 'Application' },
+					{ name: 'ChatMessage.Read.Chat', type: 'Application' },
+					{ name: 'Member.Read.Group', type: 'Application' },
+				],
+			},
+		},
+		validDomains: [domain],
+	};
+}
+
+export async function downloadTeamsManifestZip(appId: string, redirectUrl: string) {
+	const zip = new JSZip();
+
+	zip.file('manifest.json', JSON.stringify(buildTeamsManifest(appId, redirectUrl), null, 2));
+
+	const [outlineRes, colorRes] = await Promise.all([fetch('/outline.png'), fetch('/color.png')]);
+
+	if (!outlineRes.ok || !colorRes.ok) {
+		throw new Error('Failed to fetch app icon assets for the Teams manifest package.');
+	}
+
+	zip.file('outline.png', await outlineRes.arrayBuffer());
+	zip.file('color.png', await colorRes.arrayBuffer());
+
+	const blob = await zip.generateAsync({ type: 'blob' });
+	const url = URL.createObjectURL(blob);
+	const a = document.createElement('a');
+	a.href = url;
+	a.download = 'app.zip';
+	a.click();
+	URL.revokeObjectURL(url);
+}
+
+export function TeamsForm({ hasProjectConfig, onSubmit, onCancel, isPending, teamsRedirectUrl }: TeamsFormProps) {
+	const [submitError, setSubmitError] = useState<string>();
+	const form = useForm({
+		defaultValues: { appId: '', appPassword: '', tenantId: '' },
+		onSubmit: async ({ value }) => {
+			setSubmitError(undefined);
+			try {
+				await onSubmit(value);
+				if (teamsRedirectUrl) {
+					await downloadTeamsManifestZip(value.appId, teamsRedirectUrl);
+				}
+				form.reset();
+			} catch (error) {
+				setSubmitError(getSubmitErrorMessage(error, 'Failed to save integration.'));
+			}
+		},
+	});
+
+	const handleCancel = () => {
+		setSubmitError(undefined);
+		onCancel();
+	};
+
+	return (
+		<div className='flex flex-col gap-4 p-4 rounded-xl border border-border bg-background'>
+			<form
+				onSubmit={(e) => {
+					e.preventDefault();
+					form.handleSubmit();
+				}}
+				className='flex flex-col gap-4'
+			>
+				<span className='text-sm font-medium text-foreground'>Microsoft Teams</span>
+
+				<div className='grid gap-3'>
+					<PasswordField
+						form={form}
+						name='appId'
+						label='App ID'
+						placeholder='Enter your Teams App ID'
+						required
+					/>
+					<PasswordField
+						form={form}
+						name='appPassword'
+						label='App Password'
+						placeholder='Enter your Teams App Password'
+						required
+					/>
+					<PasswordField
+						form={form}
+						name='tenantId'
+						label='Tenant ID'
+						placeholder='Enter your Azure Tenant ID'
+						required
+					/>
+				</div>
+
+				{submitError && <ErrorMessage message={submitError} />}
+
+				<div className='flex justify-end gap-2 pt-2'>
+					<Button variant='ghost' size='sm' type='button' onClick={handleCancel}>
+						Cancel
+					</Button>
+					<form.Subscribe selector={(state) => [state.canSubmit, state.values] as const}>
+						{([canSubmit, values]) => (
+							<Button
+								size='sm'
+								type='submit'
+								variant='primary-gradient'
+								disabled={!canSubmit || !hasRequiredTeamsValues(values) || isPending}
+							>
+								{hasProjectConfig ? 'Update' : 'Save'}
+							</Button>
+						)}
+					</form.Subscribe>
+				</div>
+			</form>
+		</div>
+	);
+}
+
+function hasRequiredTeamsValues(values: { appId: string; appPassword: string; tenantId: string }): boolean {
+	return Boolean(values.appId.trim() && values.appPassword.trim() && values.tenantId.trim());
+}

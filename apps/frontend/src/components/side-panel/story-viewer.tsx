@@ -1,0 +1,546 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { parseStoryTabs, stripStoryTabsMarkup } from '@insight/shared/story-tabs';
+import { ShareStoryDialog } from '../share-dialog.story';
+import { StoryUnsavedChangesDialog } from '../story-unsaved-changes-dialog';
+import { StoryEditor } from './story-editor';
+import { LiveStorySettingsDialog } from './live-story-settings-dialog';
+import { ArchivedBanner } from './story-archived-banner';
+import { StoryContentLoading } from './story-content-loading';
+import { StoryHeader } from './story-header';
+import { StoryPreview } from './story-preview';
+import { StoryCodeView } from './story-code-view';
+import { StoryTabsBar } from './story-tabs-bar';
+import { StoryTabbedEditor } from './story-tabbed-editor';
+import { useStoryViewerAgentState } from './hooks/use-story-viewer-agent-state';
+import { useStoryViewerContent } from './hooks/use-story-viewer-content';
+import { useStoryViewerEnlarge } from './hooks/use-story-viewer-enlarge';
+import { useStoryViewerLiveSettings } from './hooks/use-story-viewer-live-settings';
+import { useStoryViewerSharing } from './hooks/use-story-viewer-sharing';
+import { useStoryViewerStreamScroll } from './hooks/use-story-viewer-stream-scroll';
+import { useStoryViewerSwitchStory } from './hooks/use-story-viewer-switch-story';
+import { useStoryViewerVersionActions } from './hooks/use-story-viewer-version-actions';
+import { useStoryViewerVersions } from './hooks/use-story-viewer-versions';
+import { useStoryViewerViewMode } from './hooks/use-story-viewer-view-mode';
+import type { ShareSource, StoryFormat } from '@insight/shared/types';
+import type { CustomStoryViewerAccess } from '@insight/shared/story-app';
+import type { Editor as TiptapEditor } from '@tiptap/react';
+import type { StoryCodeViewHandle } from './story-code-view';
+import { AssetAnalyticsDialog } from '@/components/asset-analytics-dialog';
+import { CustomStoryViewer } from '@/components/custom-story/custom-story-viewer';
+import { ReadonlyCustomStoryViewer } from '@/components/custom-story/readonly-custom-story-viewer';
+import { useSidePanel } from '@/contexts/side-panel';
+import { useChatActivity } from '@/hooks/use-chat-activity';
+import { useDragAutoScroll } from '@/hooks/use-drag-auto-scroll';
+import { useRetryStaleStoryRefresh } from '@/hooks/use-retry-stale-story-refresh';
+import { useStoryVersionQueryData } from '@/hooks/use-story-version-query-data';
+import { useTrackViewDuration } from '@/hooks/use-track-view-duration';
+import { selectStoryEditorCode, useStoryEditBuffer } from '@/hooks/use-story-edit-buffer';
+import { useStoryEditTransitions } from '@/hooks/use-story-edit-transitions';
+import { useStoryExitGuard } from '@/hooks/use-story-exit-guard';
+import { ReadonlyAgentMessagesProvider, useOptionalAgentContext } from '@/contexts/agent.provider';
+import { StoryChartEditProvider } from '@/contexts/story-chart-edit';
+import { StoryMapEditProvider } from '@/contexts/story-map-edit';
+import { StoryTableEditProvider } from '@/contexts/story-table-edit';
+import { StoryEmbedDataProvider } from '@/contexts/story-embed-data';
+import { Spinner } from '@/components/ui/spinner';
+import { useRegisterStoryBeforeAgentSend } from '@/contexts/story-before-agent-send';
+import { trpc } from '@/main';
+
+interface StoryViewerProps {
+	chatId: string;
+	storySlug: string;
+	isReadonlyMode?: boolean;
+	initialTabIndex?: number;
+}
+
+export function StoryViewer(props: StoryViewerProps) {
+	const { isReadonlyMode: contextReadonlyMode, isReplay, shareSource } = useSidePanel();
+	const isReadonlyMode = isReplay ? contextReadonlyMode : (props.isReadonlyMode ?? contextReadonlyMode);
+	const viewerAccess = useMemo(
+		() => (isReadonlyMode ? readonlyViewerAccess(props.chatId, shareSource, isReplay) : null),
+		[isReadonlyMode, isReplay, props.chatId, shareSource],
+	);
+	const format = useStoryFormat(props.chatId, props.storySlug, isReadonlyMode, viewerAccess);
+
+	if (format === null) {
+		return <StoryContentLoading />;
+	}
+	if (format === 'custom' && viewerAccess) {
+		return <ReadonlyCustomStoryViewer chatId={props.chatId} storySlug={props.storySlug} access={viewerAccess} />;
+	}
+	if (format === 'custom' && !isReadonlyMode) {
+		return <CustomStoryViewer chatId={props.chatId} storySlug={props.storySlug} />;
+	}
+	return <ClassicStoryViewer {...props} />;
+}
+
+function useStoryFormat(
+	chatId: string,
+	storySlug: string,
+	isReadonlyMode: boolean,
+	viewerAccess: CustomStoryViewerAccess | null,
+): StoryFormat | null {
+	const ownerQuery = useQuery({
+		...trpc.story.listVersions.queryOptions({ chatId, storySlug }),
+		enabled: !isReadonlyMode,
+	});
+	const viewerQuery = useQuery({
+		...trpc.customStoryViewer.getFormat.queryOptions({
+			access: viewerAccess ?? { kind: 'replay', chatId },
+			storySlug,
+		}),
+		enabled: viewerAccess !== null,
+	});
+	if (!isReadonlyMode) {
+		return ownerQuery.isPending ? null : (ownerQuery.data?.format ?? 'classic');
+	}
+	if (viewerAccess) {
+		return viewerQuery.isPending ? null : (viewerQuery.data?.format ?? 'classic');
+	}
+	return 'classic';
+}
+
+function readonlyViewerAccess(
+	chatId: string,
+	shareSource: ShareSource | null,
+	isReplay: boolean,
+): CustomStoryViewerAccess | null {
+	if (shareSource?.type === 'chat' && shareSource.shareId) {
+		return { kind: 'sharedChat', shareId: shareSource.shareId };
+	}
+	return isReplay ? { kind: 'replay', chatId } : null;
+}
+
+function ClassicStoryViewer({ chatId, storySlug, isReadonlyMode: readonlyProp, initialTabIndex }: StoryViewerProps) {
+	const tiptapEditorRef = useRef<TiptapEditor | null>(null);
+	const codeViewRef = useRef<StoryCodeViewHandle | null>(null);
+	const tabbedEditCodeRef = useRef<(() => string) | null>(null);
+	const [isCodeValid, setIsCodeValid] = useState(true);
+	const [activeTabIndex, setActiveTabIndex] = useState(initialTabIndex ?? 0);
+	const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+	const {
+		close: closeSidePanel,
+		isVisible: isSidePanelVisible,
+		currentStorySlug,
+		isReadonlyMode: contextReadonlyMode,
+		isReplay,
+		registerBeforeChange,
+		shareSource,
+		setCurrentStorySlug,
+		setCurrentStoryTabIndex,
+	} = useSidePanel();
+	const isReadonlyMode = isReplay ? contextReadonlyMode : (readonlyProp ?? contextReadonlyMode);
+	const { viewMode, setViewMode } = useStoryViewerViewMode();
+
+	const outerAgent = useOptionalAgentContext();
+	const outerAgentHasCorrectChat = outerAgent?.chatId === chatId;
+	const chatQuery = useQuery({
+		...trpc.chat.get.queryOptions({ chatId }),
+		staleTime: Infinity,
+		enabled: !outerAgentHasCorrectChat,
+	});
+	const chatMessages = outerAgentHasCorrectChat ? undefined : (chatQuery.data?.messages ?? null);
+
+	const isChatAgentRunning = useChatActivity(chatId).running;
+
+	const { allStories, draftStory, latestStoryOutputVersion, isAgentRunning, isStoryUpdating, isStoryInterrupted } =
+		useStoryViewerAgentState(storySlug, chatMessages, isChatAgentRunning);
+	const resolvedStorySlug = draftStory?.id ?? storySlug;
+	const isStoryStreaming = Boolean(draftStory?.isStreaming);
+	const prevSlugRef = useRef(resolvedStorySlug);
+	const {
+		versions,
+		storyId,
+		storyTitle: storedTitle,
+		archivedAt,
+		currentVersion,
+		currentVersionNumber,
+		storedVersionNumber,
+		isViewingLatest,
+		goToVersion,
+		goToLatestVersion,
+	} = useStoryViewerVersions({
+		chatId,
+		storySlug: resolvedStorySlug,
+		isAgentRunning,
+		latestStoryOutputVersion,
+		isReadonlyMode,
+	});
+	const {
+		storyTitle,
+		storyCode,
+		queryData,
+		cachedAt,
+		lastRefreshFailure,
+		needsRefresh,
+		isLoading: isContentLoading,
+	} = useStoryViewerContent({
+		storySlug,
+		resolvedStorySlug,
+		chatId,
+		draftStory,
+		currentVersion,
+		storedTitle,
+		isViewingLatest,
+		isStoryInterrupted,
+		isReadonlyMode,
+	});
+	const { queryData: versionQueryData, isPending: isVersionQueryDataPending } = useStoryVersionQueryData({
+		chatId,
+		storySlug: resolvedStorySlug,
+		versionNumber: storedVersionNumber,
+		isViewingLatest,
+		latestQueryData: queryData ?? null,
+	});
+	const tabs = useMemo(() => parseStoryTabs(storyCode ?? ''), [storyCode]);
+	const isTabbedStory = Boolean(tabs?.length);
+	const activeTab = tabs?.length ? Math.min(activeTabIndex, tabs.length - 1) : 0;
+	const storyBuffer = useStoryEditBuffer(storyCode ?? '');
+	const isCodeDirty = storyBuffer.isDirty;
+	useTrackViewDuration({
+		assetType: 'story',
+		chatId,
+		storySlug: resolvedStorySlug,
+		storyId,
+		versionNumber: storedVersionNumber > 0 ? storedVersionNumber : undefined,
+	});
+
+	const { handleSave, saveCurrentVersion, handleRestore, isSaving } = useStoryViewerVersionActions({
+		chatId,
+		storySlug: resolvedStorySlug,
+		storyTitle,
+		currentVersionCode: currentVersion?.code ?? storyCode,
+		isViewingLatest,
+		goToLatestVersion,
+		codeViewRef,
+		getCurrentCode: storyBuffer.getCode,
+		viewMode,
+		setViewMode,
+		onVersionSaved: storyBuffer.markSaved,
+	});
+	const isDirty = storyBuffer.isDirty;
+	const exitGuard = useStoryExitGuard({
+		isDirty,
+		canSave: viewMode !== 'code' || isCodeValid,
+		save: saveCurrentVersion,
+		discard: storyBuffer.discard,
+	});
+	const transitions = useStoryEditTransitions({
+		viewMode,
+		setViewMode,
+		isDirty,
+		isCodeValid,
+		isSaving,
+		save: saveCurrentVersion,
+		requestExit: exitGuard.requestExit,
+	});
+	useEffect(() => registerBeforeChange(exitGuard.requestExit), [exitGuard.requestExit, registerBeforeChange]);
+	const handleBeforeAgentSend = useCallback(async () => {
+		if (!isDirty) {
+			return { canSend: true };
+		}
+		if (viewMode === 'code' && !isCodeValid) {
+			return { canSend: false };
+		}
+		const result = await saveCurrentVersion();
+		if (result !== 'saved' && result !== 'unchanged') {
+			return { canSend: false };
+		}
+		return {
+			canSend: true,
+			afterSend: () => setViewMode('preview'),
+		};
+	}, [isCodeValid, isDirty, saveCurrentVersion, setViewMode, viewMode]);
+	useRegisterStoryBeforeAgentSend({
+		chatId,
+		enabled: !isReadonlyMode && isSidePanelVisible && currentStorySlug === resolvedStorySlug,
+		guard: handleBeforeAgentSend,
+	});
+	const { isShareDialogOpen, setIsShareDialogOpen, isShared } = useStoryViewerSharing({
+		chatId,
+		storySlug: resolvedStorySlug,
+	});
+	const [isAnalyticsOpen, setIsAnalyticsOpen] = useState(false);
+	const {
+		isLive,
+		isLiveTextDynamic,
+		cacheSchedule,
+		cacheScheduleDescription,
+		isUpdating: isLiveUpdating,
+		isRefreshing,
+		handleSaveSettings,
+		handleRefreshData,
+	} = useStoryViewerLiveSettings({ chatId, storySlug: resolvedStorySlug });
+	useRetryStaleStoryRefresh({
+		storyKey: `${chatId}/${resolvedStorySlug}`,
+		needsRefresh,
+		isRefreshing,
+		refresh: handleRefreshData,
+	});
+	const [isLiveSettingsOpen, setIsLiveSettingsOpen] = useState(false);
+	const { handleEnlarge } = useStoryViewerEnlarge({ storyId });
+
+	const handleOpenShare = useCallback(() => setIsShareDialogOpen(true), [setIsShareDialogOpen]);
+	const handleOpenAnalytics = useCallback(() => setIsAnalyticsOpen(true), []);
+	const handleOpenLiveSettings = useCallback(() => setIsLiveSettingsOpen(true), []);
+
+	const renderStoryViewer = useCallback(
+		(nextStorySlug: string) => (
+			<StoryViewer chatId={chatId} storySlug={nextStorySlug} isReadonlyMode={readonlyProp} />
+		),
+		[chatId, readonlyProp],
+	);
+	const { switchStory } = useStoryViewerSwitchStory({ renderStoryViewer });
+	const handleSelectVersion = useCallback(
+		(versionNumber: number) => exitGuard.requestExit(() => goToVersion(versionNumber)),
+		[exitGuard, goToVersion],
+	);
+	const versionDates = useMemo(() => versions.map((version) => version.createdAt), [versions]);
+
+	useEffect(() => {
+		if (viewMode !== 'code') {
+			setIsCodeValid(true);
+		}
+	}, [viewMode]);
+
+	useEffect(() => {
+		if (prevSlugRef.current !== resolvedStorySlug) {
+			prevSlugRef.current = resolvedStorySlug;
+			setActiveTabIndex(0);
+		}
+	}, [resolvedStorySlug]);
+
+	useEffect(() => {
+		setCurrentStorySlug(resolvedStorySlug);
+	}, [resolvedStorySlug, setCurrentStorySlug]);
+
+	useEffect(() => {
+		setCurrentStoryTabIndex(activeTab);
+	}, [activeTab, setCurrentStoryTabIndex]);
+
+	useStoryViewerStreamScroll({
+		scrollContainerRef,
+		isAppendingContent: Boolean(draftStory?.isStreaming),
+		code: storyCode,
+		viewMode,
+	});
+	useDragAutoScroll(scrollContainerRef);
+
+	if (!storyCode) {
+		if (chatQuery.isLoading) {
+			return (
+				<div className='flex h-full items-center justify-center'>
+					<Spinner />
+				</div>
+			);
+		}
+		return (
+			<div className='flex h-full items-center justify-center text-muted-foreground text-sm'>
+				{isAgentRunning ? 'Waiting for story stream...' : 'No Story content available.'}
+			</div>
+		);
+	}
+
+	const editCode = selectStoryEditorCode({
+		persistedCode: storyCode,
+		bufferCode: storyBuffer.getCode(),
+		isDirty: storyBuffer.isDirty,
+		isSaving,
+	});
+	const editTabs = parseStoryTabs(editCode);
+	const isEditTabbedStory = Boolean(editTabs?.length);
+	const codeDraft = selectStoryEditorCode({
+		persistedCode: storyCode,
+		bufferCode: storyBuffer.getCode(),
+		isDirty: storyBuffer.isDirty,
+		isSaving,
+	});
+	const content = (
+		<div className='flex h-full flex-col'>
+			<StoryHeader
+				title={storyTitle}
+				chatId={chatId}
+				storySlug={resolvedStorySlug}
+				storyId={storyId}
+				shareSource={shareSource}
+				allStories={allStories}
+				onSwitchStory={switchStory}
+				viewMode={viewMode}
+				onViewModeChange={transitions.requestViewMode}
+				currentVersion={currentVersionNumber}
+				versionDates={versionDates}
+				versionNumber={currentVersion?.version}
+				versionDate={currentVersion?.createdAt}
+				onSelectVersion={handleSelectVersion}
+				isViewingLatest={isViewingLatest}
+				onRestore={handleRestore}
+				onSave={handleSave}
+				onCancel={transitions.requestCancel}
+				onShare={handleOpenShare}
+				onOpenAnalytics={handleOpenAnalytics}
+				onEnlarge={handleEnlarge}
+				isShared={isShared}
+				isAgentRunning={isAgentRunning}
+				isStoryUpdating={isStoryUpdating}
+				isSaving={isSaving}
+				isReadonlyMode={isReadonlyMode}
+				isReplay={isReplay}
+				isLive={isLive}
+				isLiveUpdating={isLiveUpdating}
+				isRefreshing={isRefreshing}
+				onRefreshData={handleRefreshData}
+				onOpenLiveSettings={handleOpenLiveSettings}
+				onClose={closeSidePanel}
+				isCodeDirty={isCodeDirty}
+				isCodeValid={isCodeValid}
+				cachedAt={cachedAt}
+				lastRefreshFailure={lastRefreshFailure}
+			/>
+
+			{Boolean(archivedAt) && <ArchivedBanner chatId={chatId} storySlug={resolvedStorySlug} />}
+
+			{viewMode === 'preview' && isTabbedStory && tabs && (
+				<StoryTabsBar
+					tabs={tabs.map((tab) => ({ title: tab.title }))}
+					activeIndex={activeTab}
+					onSelect={setActiveTabIndex}
+					contentClassName='px-6'
+				/>
+			)}
+
+			<div ref={scrollContainerRef} className='flex-1 min-h-0 overflow-auto'>
+				{renderWithEditProvider(
+					!isReadonlyMode && isViewingLatest && !archivedAt && !isAgentRunning && viewMode !== 'edit',
+					{
+						chatId,
+						storySlug: resolvedStorySlug,
+						storyTitle,
+						storyCode,
+					},
+					viewMode === 'preview' ? (
+						isContentLoading ? (
+							<StoryContentLoading />
+						) : (
+							<StoryPreview
+								code={
+									isTabbedStory && tabs ? tabs[activeTab].innerCode : stripStoryTabsMarkup(storyCode)
+								}
+								fullCode={storyCode}
+								cacheSchedule={cacheSchedule}
+								queryData={versionQueryData}
+								chatId={chatId}
+								storySlug={resolvedStorySlug}
+								versionKey={isViewingLatest ? undefined : currentVersionNumber}
+								filtersEnabled={isViewingLatest && !isAgentRunning}
+								isStreaming={isStoryStreaming}
+								isDataPending={isVersionQueryDataPending}
+								isViewingLatest={isViewingLatest}
+							/>
+						)
+					) : viewMode === 'edit' ? (
+						<StoryEmbedDataProvider value={versionQueryData}>
+							{isEditTabbedStory ? (
+								<StoryTabbedEditor
+									code={editCode}
+									editorRef={tiptapEditorRef}
+									onSave={handleSave}
+									onChange={storyBuffer.handleCodeChange}
+									getCodeRef={tabbedEditCodeRef}
+									barContentClassName='px-6'
+									contentClassName='p-6'
+								/>
+							) : (
+								<StoryEditor
+									code={editCode}
+									editorRef={tiptapEditorRef}
+									onSave={handleSave}
+									onChange={storyBuffer.handleCodeChange}
+								/>
+							)}
+						</StoryEmbedDataProvider>
+					) : (
+						<StoryCodeView
+							code={codeDraft}
+							readOnly={isReadonlyMode}
+							codeRef={codeViewRef}
+							onCodeChange={storyBuffer.handleCodeChange}
+							onValidChange={setIsCodeValid}
+							onSave={handleSave}
+						/>
+					),
+				)}
+			</div>
+
+			<ShareStoryDialog
+				open={isShareDialogOpen}
+				onOpenChange={setIsShareDialogOpen}
+				chatId={chatId}
+				storySlug={resolvedStorySlug}
+			/>
+
+			<AssetAnalyticsDialog
+				open={isAnalyticsOpen}
+				onOpenChange={setIsAnalyticsOpen}
+				assetType='story'
+				chatId={chatId}
+				storyId={storyId ?? undefined}
+				storySlug={resolvedStorySlug}
+			/>
+
+			<LiveStorySettingsDialog
+				open={isLiveSettingsOpen}
+				onOpenChange={setIsLiveSettingsOpen}
+				chatId={chatId}
+				storySlug={resolvedStorySlug}
+				isLive={isLive}
+				isLiveTextDynamic={isLiveTextDynamic}
+				cacheSchedule={cacheSchedule}
+				cacheScheduleDescription={cacheScheduleDescription}
+				isUpdating={isLiveUpdating}
+				onSaveSettings={handleSaveSettings}
+			/>
+			<StoryUnsavedChangesDialog {...exitGuard.dialogProps} />
+		</div>
+	);
+
+	if (!chatMessages) {
+		return content;
+	}
+
+	return <ReadonlyAgentMessagesProvider messages={chatMessages}>{content}</ReadonlyAgentMessagesProvider>;
+}
+
+function renderWithEditProvider(
+	enabled: boolean,
+	params: { chatId: string; storySlug: string; storyTitle: string; storyCode: string },
+	children: React.ReactNode,
+) {
+	if (!enabled) {
+		return children;
+	}
+	return (
+		<StoryChartEditProvider
+			chatId={params.chatId}
+			storySlug={params.storySlug}
+			storyTitle={params.storyTitle}
+			storyCode={params.storyCode}
+		>
+			<StoryTableEditProvider
+				chatId={params.chatId}
+				storySlug={params.storySlug}
+				storyTitle={params.storyTitle}
+				storyCode={params.storyCode}
+			>
+				<StoryMapEditProvider
+					chatId={params.chatId}
+					storySlug={params.storySlug}
+					storyTitle={params.storyTitle}
+					storyCode={params.storyCode}
+				>
+					{children}
+				</StoryMapEditProvider>
+			</StoryTableEditProvider>
+		</StoryChartEditProvider>
+	);
+}

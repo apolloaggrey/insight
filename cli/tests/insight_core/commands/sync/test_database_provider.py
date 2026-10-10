@@ -1,0 +1,334 @@
+"""Unit tests for the database sync provider."""
+
+from io import StringIO
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from rich.console import Console
+
+from insight_core.commands.sync.cleanup import DatabaseSyncState
+from insight_core.commands.sync.providers.databases.provider import (
+    DatabaseSyncProvider,
+    _fetch_query_history,
+    _matches_selection,
+)
+from insight_core.config.base import InsightConfig
+from insight_core.config.databases.duckdb import DuckDBConfig
+from insight_core.deps import MissingDependencyError
+from insight_core.ui import UI
+
+
+class TestDatabaseSyncProvider:
+    def test_provider_properties(self):
+        provider = DatabaseSyncProvider()
+        assert provider.name == "Databases"
+        assert provider.emoji == "🗄️"
+        assert provider.default_output_dir == "databases"
+
+    def test_get_items_returns_databases_from_config(self):
+        provider = DatabaseSyncProvider()
+        mock_config = MagicMock(spec=InsightConfig)
+        mock_db1 = MagicMock()
+        mock_db1.name = "db1"
+        mock_db2 = MagicMock()
+        mock_db2.name = "db2"
+        mock_config.databases = [mock_db1, mock_db2]
+
+        items = provider.get_items(mock_config)
+
+        assert len(items) == 2
+
+    def test_get_items_returns_empty_list_when_no_databases(self):
+        provider = DatabaseSyncProvider()
+        mock_config = MagicMock(spec=InsightConfig)
+        mock_config.databases = []
+
+        items = provider.get_items(mock_config)
+
+        assert items == []
+
+    @patch("insight_core.commands.sync.providers.databases.provider.UI._console")
+    def test_sync_returns_zero_when_no_items(self, mock_console, tmp_path: Path):
+        provider = DatabaseSyncProvider()
+
+        result = provider.sync([], tmp_path)
+
+        assert result.provider_name == "Databases"
+        assert result.items_synced == 0
+
+    def test_should_sync_returns_true_when_databases_exist(self):
+        provider = DatabaseSyncProvider()
+        mock_config = MagicMock(spec=InsightConfig)
+        mock_config.databases = [MagicMock()]
+
+        assert provider.should_sync(mock_config) is True
+
+    def test_should_sync_returns_false_when_no_databases(self):
+        provider = DatabaseSyncProvider()
+        mock_config = MagicMock(spec=InsightConfig)
+        mock_config.databases = []
+
+        assert provider.should_sync(mock_config) is False
+
+    @patch("insight_core.commands.sync.providers.databases.provider.cleanup_stale_paths", return_value=0)
+    @patch("insight_core.commands.sync.providers.databases.provider.sync_database")
+    def test_sync_uses_distinct_db_folders_for_duplicate_database_names(
+        self, mock_sync_database, _mock_cleanup_stale_paths, tmp_path: Path
+    ):
+        provider = DatabaseSyncProvider()
+
+        db1 = MagicMock()
+        db1.name = "clickhouse-last"
+        db1.type = "clickhouse"
+        db1.accessors = []
+        db1.get_database_name.return_value = "default"
+
+        db2 = MagicMock()
+        db2.name = "clickhouse-numia"
+        db2.type = "clickhouse"
+        db2.accessors = []
+        db2.get_database_name.return_value = "default"
+
+        mock_sync_database.side_effect = [
+            DatabaseSyncState(db_path=tmp_path / "type=clickhouse" / "database=clickhouse-last"),
+            DatabaseSyncState(db_path=tmp_path / "type=clickhouse" / "database=clickhouse-numia"),
+        ]
+
+        provider.sync([db1, db2], tmp_path)
+
+        db_folders = [call.kwargs.get("db_folder") for call in mock_sync_database.call_args_list]
+        assert db_folders == [
+            "database=clickhouse-last",
+            "database=clickhouse-numia",
+        ]
+
+    @patch("insight_core.commands.sync.providers.databases.provider.cleanup_stale_paths", return_value=0)
+    @patch("insight_core.commands.sync.providers.databases.provider.sync_database")
+    def test_filtered_sync_resolves_db_folder_against_all_configured_databases(
+        self, mock_sync_database, _mock_cleanup_stale_paths, tmp_path: Path
+    ):
+        provider = DatabaseSyncProvider()
+        shop_a = DuckDBConfig(name="shop_a_ro", path=str(tmp_path / "shop_a" / "retaildb.duckdb"))
+        shop_b = DuckDBConfig(name="shop_b_ro", path=str(tmp_path / "shop_b" / "retaildb.duckdb"))
+        provider.pre_sync(InsightConfig(project_name="shops", databases=[shop_a, shop_b]), tmp_path)
+        mock_sync_database.return_value = DatabaseSyncState(db_path=tmp_path / "type=duckdb" / "database=shop_b_ro")
+
+        provider.sync([shop_b], tmp_path)
+
+        assert mock_sync_database.call_args.kwargs.get("db_folder") == "database=shop_b_ro"
+
+    @patch("insight_core.commands.sync.providers.databases.provider.cleanup_stale_paths", return_value=0)
+    @patch("insight_core.commands.sync.providers.databases.provider.sync_database")
+    def test_sync_runs_databases_with_threads(self, mock_sync_database, _mock_cleanup_stale_paths, tmp_path: Path):
+        provider = DatabaseSyncProvider()
+
+        db1 = MagicMock()
+        db1.name = "db1"
+        db1.type = "duckdb"
+        db1.templates = [MagicMock(value="columns")]
+        db1.get_database_name.return_value = "db1"
+
+        db2 = MagicMock()
+        db2.name = "db2"
+        db2.type = "duckdb"
+        db2.templates = [MagicMock(value="columns")]
+        db2.get_database_name.return_value = "db2"
+
+        def _sync_database(db, *_args, **_kwargs):
+            state = DatabaseSyncState(db_path=tmp_path / db.name)
+            state.add_schema("main")
+            state.add_table("main", "orders")
+            return state
+
+        mock_sync_database.side_effect = _sync_database
+
+        result = provider.sync([db1, db2], tmp_path, threads=2)
+
+        assert result.details == {"datasets": 2, "tables": 2, "removed": 0}
+        assert mock_sync_database.call_count == 2
+
+    @patch(
+        "insight_core.commands.sync.providers.databases.provider.get_database_folder_names",
+        return_value=["database=dev"],
+    )
+    @patch("insight_core.commands.sync.providers.databases.provider.sync_database")
+    def test_sync_escapes_missing_dependency_error_markup(
+        self, mock_sync_database, _mock_get_database_folder_names, tmp_path: Path
+    ):
+        provider = DatabaseSyncProvider()
+        output = StringIO()
+        console = Console(file=output, force_terminal=False)
+
+        db = MagicMock()
+        db.name = "redshift"
+        db.templates = [MagicMock(value="columns")]
+        mock_sync_database.side_effect = MissingDependencyError(
+            "ibis-framework[postgres]",
+            "redshift",
+            "to connect to redshift databases",
+        )
+
+        with (
+            patch("insight_core.commands.sync.providers.databases.provider.console", console),
+            patch.object(UI, "_console", console),
+        ):
+            result = provider.sync([db], tmp_path)
+
+        text = output.getvalue()
+        assert "ibis-framework[postgres]" in text
+        assert "insight-core[redshift]" in text
+        assert result.error is not None
+        assert result.error.startswith("Failed to sync 1 database: redshift:")
+
+    @patch(
+        "insight_core.commands.sync.providers.databases.provider.get_database_folder_names",
+        return_value=["database=prod-red"],
+    )
+    @patch("insight_core.commands.sync.providers.databases.provider.sync_database")
+    def test_sync_escapes_database_name_markup(
+        self, mock_sync_database, _mock_get_database_folder_names, tmp_path: Path
+    ):
+        provider = DatabaseSyncProvider()
+        output = StringIO()
+        console = Console(file=output, force_terminal=False)
+
+        db = MagicMock()
+        db.name = "prod[red]"
+        db.templates = [MagicMock(value="columns")]
+        mock_sync_database.side_effect = RuntimeError("connection failed")
+
+        with (
+            patch("insight_core.commands.sync.providers.databases.provider.console", console),
+            patch.object(UI, "_console", console),
+        ):
+            result = provider.sync([db], tmp_path)
+            console.print(result.error)
+
+        assert "prod[red]" in output.getvalue()
+
+
+class TestMatchesSelection:
+    def test_schema_only_pattern_selects_whole_schema(self):
+        assert _matches_selection("analytics", "orders", ["analytics"]) is True
+        assert _matches_selection("analytics", "customers", ["analytics"]) is True
+        assert _matches_selection("staging", "orders", ["analytics"]) is False
+
+    def test_schema_table_pattern_selects_single_table(self):
+        assert _matches_selection("analytics", "orders", ["analytics.orders"]) is True
+        assert _matches_selection("analytics", "customers", ["analytics.orders"]) is False
+
+    def test_glob_patterns_are_supported(self):
+        assert _matches_selection("staging", "dim_users", ["staging.dim_*"]) is True
+        assert _matches_selection("staging", "fct_orders", ["staging.dim_*"]) is False
+
+    def test_any_pattern_matches(self):
+        select = ["analytics.orders", "staging"]
+        assert _matches_selection("analytics", "orders", select) is True
+        assert _matches_selection("staging", "anything", select) is True
+        assert _matches_selection("analytics", "customers", select) is False
+
+    def test_matching_is_case_insensitive(self):
+        # Snowflake-style uppercased identifiers should match lowercase patterns.
+        assert _matches_selection("ANALYTICS", "ORDERS", ["analytics.orders"]) is True
+        assert _matches_selection("ANALYTICS", "ORDERS", ["analytics"]) is True
+        assert _matches_selection("analytics", "orders", ["ANALYTICS.ORDERS"]) is True
+
+    def test_catalog_qualified_schema_is_supported(self):
+        # Some databases (e.g. StarRocks) qualify schemas with a catalog prefix.
+        assert _matches_selection("catalog.analytics", "orders", ["catalog.analytics"]) is True
+        assert _matches_selection("catalog.analytics", "orders", ["catalog.analytics.orders"]) is True
+        assert _matches_selection("catalog.analytics", "orders", ["catalog.analytics.customers"]) is False
+        # A bare schema name without the catalog prefix does not match.
+        assert _matches_selection("catalog.analytics", "orders", ["analytics"]) is False
+
+
+class TestSelectSkipsCleanup:
+    @patch("insight_core.commands.sync.providers.databases.provider.cleanup_stale_paths", return_value=3)
+    @patch("insight_core.commands.sync.providers.databases.provider.sync_database")
+    def test_cleanup_runs_without_select(self, mock_sync_database, mock_cleanup, tmp_path: Path):
+        provider = DatabaseSyncProvider()
+        db = MagicMock()
+        db.name = "db1"
+        db.type = "duckdb"
+        db.templates = [MagicMock(value="columns")]
+        db.get_database_name.return_value = "db1"
+        mock_sync_database.return_value = DatabaseSyncState(db_path=tmp_path / "db1")
+
+        result = provider.sync([db], tmp_path)
+
+        mock_cleanup.assert_called_once()
+        assert result.details is not None
+        assert result.details["removed"] == 3
+        assert mock_sync_database.call_args.kwargs.get("select") is None
+
+    @patch("insight_core.commands.sync.providers.databases.provider.cleanup_stale_paths", return_value=3)
+    @patch("insight_core.commands.sync.providers.databases.provider.sync_database")
+    def test_cleanup_skipped_with_select(self, mock_sync_database, mock_cleanup, tmp_path: Path):
+        provider = DatabaseSyncProvider()
+        db = MagicMock()
+        db.name = "db1"
+        db.type = "duckdb"
+        db.templates = [MagicMock(value="columns")]
+        db.get_database_name.return_value = "db1"
+        mock_sync_database.return_value = DatabaseSyncState(db_path=tmp_path / "db1")
+
+        result = provider.sync([db], tmp_path, select=["analytics.orders"])
+
+        mock_cleanup.assert_not_called()
+        assert result.details is not None
+        assert result.details["removed"] == 0
+        assert mock_sync_database.call_args.kwargs.get("select") == ["analytics.orders"]
+
+
+class TestFetchQueryHistoryFiltering:
+    """Verify that exclude patterns are applied after fetching query history."""
+
+    def _build_cursor(self, queries: list[str]) -> MagicMock:
+        cursor = MagicMock(spec=["description", "fetchall"])
+        cursor.description = [("query_text",)]
+        cursor.fetchall.return_value = [(q,) for q in queries]
+        return cursor
+
+    def test_exclude_patterns_drop_matching_queries(self):
+        db = DuckDBConfig(
+            name="duck",
+            path=":memory:",
+            query_history_sql="SELECT q AS query_text FROM logs",
+            query_history_exclude_patterns=[r"SYSTEM\$", r"^SELECT CURRENT_SESSION"],
+        )
+        conn = MagicMock()
+        conn.raw_sql.return_value = self._build_cursor(
+            [
+                "SELECT * FROM users",
+                "CALL SYSTEM$GET_RECENT_IN_APP_NOTIFICATIONS()",
+                "SELECT CURRENT_SESSION()",
+                "SELECT * FROM orders",
+            ]
+        )
+
+        result = _fetch_query_history(db, conn)
+
+        assert result == ["SELECT * FROM users", "SELECT * FROM orders"]
+        conn.raw_sql.assert_called_once_with("SELECT q AS query_text FROM logs")
+
+    def test_no_exclude_patterns_returns_all_queries(self):
+        db = DuckDBConfig(
+            name="duck",
+            path=":memory:",
+            query_history_sql="SELECT q AS query_text FROM logs",
+        )
+        conn = MagicMock()
+        conn.raw_sql.return_value = self._build_cursor(["SELECT 1", "SELECT 2"])
+
+        result = _fetch_query_history(db, conn)
+
+        assert result == ["SELECT 1", "SELECT 2"]
+
+    def test_returns_empty_when_no_query_history_sql(self):
+        db = DuckDBConfig(name="duck", path=":memory:")
+        conn = MagicMock()
+
+        result = _fetch_query_history(db, conn)
+
+        assert result == []
+        conn.raw_sql.assert_not_called()

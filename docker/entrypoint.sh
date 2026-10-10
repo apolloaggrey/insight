@@ -1,0 +1,220 @@
+#!/bin/bash
+set -e
+
+echo "=== insight Chat Server Entrypoint ==="
+
+# Default values — cloud mode manages projects dynamically via the API
+if [ "$INSIGHT_MODE" = "cloud" ]; then
+    INSIGHT_CONTEXT_SOURCE="${INSIGHT_CONTEXT_SOURCE:-api}"
+    unset INSIGHT_DEFAULT_PROJECT_PATH
+else
+    INSIGHT_CONTEXT_SOURCE="${INSIGHT_CONTEXT_SOURCE:-local}"
+    INSIGHT_DEFAULT_PROJECT_PATH="${INSIGHT_DEFAULT_PROJECT_PATH:-/app/context}"
+fi
+
+echo "Context source: $INSIGHT_CONTEXT_SOURCE"
+echo "Target path: $INSIGHT_DEFAULT_PROJECT_PATH"
+
+# Initialize context based on source type
+if [ "$INSIGHT_CONTEXT_SOURCE" = "git" ]; then
+    echo ""
+    echo "=== Initializing Git Context ==="
+    
+    if [ -z "$INSIGHT_CONTEXT_GIT_URL" ]; then
+        echo "ERROR: INSIGHT_CONTEXT_GIT_URL is required when INSIGHT_CONTEXT_SOURCE=git"
+        exit 1
+    fi
+    
+    INSIGHT_CONTEXT_GIT_BRANCH="${INSIGHT_CONTEXT_GIT_BRANCH:-main}"
+    INSIGHT_CONTEXT_GIT_SUBPATH="${INSIGHT_CONTEXT_GIT_SUBPATH#/}"
+    INSIGHT_CONTEXT_GIT_SUBPATH="${INSIGHT_CONTEXT_GIT_SUBPATH%/}"
+    
+    # Pick auth scheme from URL: SSH (deploy key) vs HTTPS (PAT or anonymous)
+    GIT_URL="$INSIGHT_CONTEXT_GIT_URL"
+    case "$INSIGHT_CONTEXT_GIT_URL" in
+        git@*|ssh://*)
+            if [ -z "$INSIGHT_CONTEXT_GIT_SSH_KEY" ]; then
+                echo "ERROR: SSH git URL requires INSIGHT_CONTEXT_GIT_SSH_KEY"
+                exit 1
+            fi
+            
+            SSH_DIR="/tmp/.insight-ssh"
+            mkdir -p "$SSH_DIR"
+            chmod 700 "$SSH_DIR"
+            
+            SSH_KEY_FILE="$SSH_DIR/id_deploy"
+            printf '%s\n' "$INSIGHT_CONTEXT_GIT_SSH_KEY" > "$SSH_KEY_FILE"
+            chmod 600 "$SSH_KEY_FILE"
+            
+            # Pre-pin host keys for GitHub (https://api.github.com/meta) and Bitbucket (https://bitbucket.org/site/ssh)
+            KNOWN_HOSTS_FILE="$SSH_DIR/known_hosts"
+            cat > "$KNOWN_HOSTS_FILE" <<'EOF'
+github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+bitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO
+bitbucket.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPIQmuzMBuKdWeF4+a2sjSSpBK0iqitSQ+5BM9KhpexuGt20JpTVM7u5BDZngncgrqDMbWdxMWWOGtZ9UgbqgZE=
+bitbucket.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDQeJzhupRu0u0cdegZIa8e86EG2qOCsIsD1Xw0xSeiPDlCr7kq97NLmMbpKTX6Esc30NuoqEEHCuc7yWtwp8dI76EEEB1VqY9QJq6vk+aySyboD5QF61I/1WeTwu+deCbgKMGbUijeXhtfbxSxm6JwGrXrhBdofTsbKRUsrN1WoNgUa8uqN1Vx6WAJw1JHPhglEGGHea6QICwJOAr/6mrui/oB7pkaWKHj3z7d1IC4KWLtY47elvjbaTlkN04Kc/5LFEirorGYVbt15kAUlqGM65pk6ZBxtaO3+30LVlORZkxOh+LKL/BvbZ/iRNhItLqNyieoQj/uh/7Iv4uyH/cV/0b4WDSd3DptigWq84lJubb9t/DnZlrJazxyDCulTmKdOR7vs9gMTo+uoIrPSb8ScTtvw65+odKAlBj59dhnVp9zd7QUojOpXlL62Aw56U4oO+FALuevvMjiWeavKhJqlR7i5n9srYcrNV7ttmDw7kf/97P5zauIhxcjX+xHv4M=
+EOF
+            chown root:insight "$SSH_DIR"
+            chown insight:insight "$SSH_KEY_FILE"
+            chown root:insight "$KNOWN_HOSTS_FILE"
+            chmod 750 "$SSH_DIR"
+            chmod 600 "$SSH_KEY_FILE"
+            chmod 640 "$KNOWN_HOSTS_FILE"
+            
+            export GIT_SSH_COMMAND="ssh -i $SSH_KEY_FILE -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN_HOSTS_FILE -o StrictHostKeyChecking=yes"
+            echo "Using SSH deploy key authentication"
+            ;;
+        https://*|http://*)
+            if [ -n "$INSIGHT_CONTEXT_GIT_TOKEN" ]; then
+                GIT_URL=$(echo "$INSIGHT_CONTEXT_GIT_URL" | sed "s|https://|https://${INSIGHT_CONTEXT_GIT_TOKEN}@|")
+                echo "Using HTTPS token authentication"
+            fi
+            ;;
+        *)
+            echo "ERROR: Unsupported INSIGHT_CONTEXT_GIT_URL scheme: $INSIGHT_CONTEXT_GIT_URL"
+            echo "Use https://… (with optional INSIGHT_CONTEXT_GIT_TOKEN) or git@…/ssh://… (with INSIGHT_CONTEXT_GIT_SSH_KEY)"
+            exit 1
+            ;;
+    esac
+    
+    # Git runs as root here while the repo is owned by `insight` (see the chown below),
+    # which git rejects as "dubious ownership" on subsequent starts.
+    git config --global --replace-all safe.directory "$INSIGHT_DEFAULT_PROJECT_PATH"
+
+    # Clone or pull
+    if [ -d "$INSIGHT_DEFAULT_PROJECT_PATH/.git" ]; then
+        echo "Repository exists, pulling latest..."
+        cd "$INSIGHT_DEFAULT_PROJECT_PATH"
+        if [ -n "$INSIGHT_CONTEXT_GIT_SUBPATH" ]; then
+            git sparse-checkout set "$INSIGHT_CONTEXT_GIT_SUBPATH"
+        fi
+        git fetch "$GIT_URL" "$INSIGHT_CONTEXT_GIT_BRANCH" --depth=1
+        git reset --hard FETCH_HEAD
+        echo "✓ Context updated"
+    else
+        echo "Cloning repository..."
+        # Ensure parent directory exists
+        mkdir -p "$(dirname "$INSIGHT_DEFAULT_PROJECT_PATH")"
+        
+        # Remove target if it exists but isn't a git repo
+        if [ -d "$INSIGHT_DEFAULT_PROJECT_PATH" ]; then
+            rm -rf "$INSIGHT_DEFAULT_PROJECT_PATH"
+        fi
+        
+        if [ -n "$INSIGHT_CONTEXT_GIT_SUBPATH" ]; then
+            echo "Sparse checkout: only fetching '$INSIGHT_CONTEXT_GIT_SUBPATH'"
+            git clone --branch "$INSIGHT_CONTEXT_GIT_BRANCH" --depth 1 --single-branch \
+                --filter=blob:none --sparse "$GIT_URL" "$INSIGHT_DEFAULT_PROJECT_PATH"
+            cd "$INSIGHT_DEFAULT_PROJECT_PATH"
+            git sparse-checkout set "$INSIGHT_CONTEXT_GIT_SUBPATH"
+        else
+            git clone --branch "$INSIGHT_CONTEXT_GIT_BRANCH" --depth 1 --single-branch "$GIT_URL" "$INSIGHT_DEFAULT_PROJECT_PATH"
+        fi
+        echo "✓ Context cloned"
+    fi
+    
+    # The clone runs as root but the services run as `insight`, which writes into the
+    # context (discovered MCP specs, query results, refreshed metadata).
+    chown -R insight:insight "$INSIGHT_DEFAULT_PROJECT_PATH"
+    
+    # Resolve project path (subpath if set, else repo root)
+    if [ -n "$INSIGHT_CONTEXT_GIT_SUBPATH" ]; then
+        INSIGHT_DEFAULT_PROJECT_PATH="$INSIGHT_DEFAULT_PROJECT_PATH/$INSIGHT_CONTEXT_GIT_SUBPATH"
+    fi
+    
+    # Validate context
+    if [ ! -f "$INSIGHT_DEFAULT_PROJECT_PATH/insight_config.yaml" ]; then
+        echo "ERROR: insight_config.yaml not found in $INSIGHT_DEFAULT_PROJECT_PATH"
+        exit 1
+    fi
+    
+    echo "✓ Context validated"
+
+elif [ "$INSIGHT_CONTEXT_SOURCE" = "local" ]; then
+    echo ""
+    echo "=== Validating Local Context ==="
+    
+    if [ ! -d "$INSIGHT_DEFAULT_PROJECT_PATH" ]; then
+        echo "ERROR: Context path does not exist: $INSIGHT_DEFAULT_PROJECT_PATH"
+        echo "For local mode, ensure the path is mounted as a Docker volume"
+        echo "or use INSIGHT_CONTEXT_SOURCE=git for git-based context."
+        exit 1
+    fi
+    
+    if [ ! -f "$INSIGHT_DEFAULT_PROJECT_PATH/insight_config.yaml" ]; then
+        echo "ERROR: insight_config.yaml not found in $INSIGHT_DEFAULT_PROJECT_PATH"
+        echo "Ensure the context path contains a valid insight project."
+        exit 1
+    fi
+    
+    echo "✓ Local context validated"
+
+elif [ "$INSIGHT_CONTEXT_SOURCE" = "api" ]; then
+    echo ""
+    echo "=== API Context Mode ==="
+    echo "Context will be deployed via insight deploy CLI command."
+    export INSIGHT_PROJECTS_DIR="${INSIGHT_PROJECTS_DIR:-/app/projects}"
+    mkdir -p "$INSIGHT_PROJECTS_DIR"
+    chown insight:insight "$INSIGHT_PROJECTS_DIR"
+    unset INSIGHT_DEFAULT_PROJECT_PATH
+
+else
+    echo "ERROR: Unknown INSIGHT_CONTEXT_SOURCE: $INSIGHT_CONTEXT_SOURCE"
+    echo "Must be 'local', 'git', or 'api'"
+    exit 1
+fi
+
+# The agent writes into the context (discovered MCP specs, query results), so the
+# `insight` user needs write access. A root-owned bind mount is the usual culprit.
+if [ -n "$INSIGHT_DEFAULT_PROJECT_PATH" ] && ! su insight -s /bin/sh -c "test -w '$INSIGHT_DEFAULT_PROJECT_PATH'"; then
+    echo "⚠ $INSIGHT_DEFAULT_PROJECT_PATH is not writable by the insight user (uid $(id -u insight))."
+    echo "  MCP tool discovery and other context writes will fail."
+    echo "  Fix the ownership on the host: chown -R $(id -u insight):$(id -g insight) <context-folder>"
+fi
+
+echo ""
+echo "=== Starting Services ==="
+
+# Grant the insight user access to /dev/kvm if it exists (needed for Boxlite sandboxing)
+if [ -e /dev/kvm ]; then
+    KVM_GID=$(stat -c '%g' /dev/kvm)
+    if ! getent group kvm > /dev/null 2>&1; then
+        groupadd -g "$KVM_GID" kvm
+    fi
+    usermod -aG kvm insight
+    echo "✓ Added insight user to kvm group (GID $KVM_GID)"
+fi
+
+# Generate BETTER_AUTH_SECRET if not provided
+if [ -z "$BETTER_AUTH_SECRET" ]; then
+    export BETTER_AUTH_SECRET=$(openssl rand -hex 32)
+    echo "⚠ BETTER_AUTH_SECRET not set — generated a random one."
+    echo "  Sessions will not persist across restarts. Set BETTER_AUTH_SECRET for persistence."
+fi
+
+# Export the path for child processes
+if [ "$INSIGHT_MODE" != "cloud" ]; then
+    export INSIGHT_DEFAULT_PROJECT_PATH
+fi
+
+# Seed demo data once the server is up (used by PR previews, where there is no
+# way to `docker exec` into the running container)
+if [ "$SEED_ON_START" = "true" ]; then
+    (
+        SERVER_URL="http://127.0.0.1:${SERVER_PORT:-5005}"
+        for _ in $(seq 1 60); do
+            if curl -sf -o /dev/null "$SERVER_URL"; then
+                echo "=== Seeding database ==="
+                su insight -s /bin/bash -c "cd /app && bun run apps/backend/scripts/db.seed.ts" || echo "⚠ Seeding failed"
+                exit 0
+            fi
+            sleep 2
+        done
+        echo "⚠ Server did not become ready in time; skipping seed"
+    ) &
+fi
+
+# Start supervisord (which manages FastAPI and Chat Server)
+exec /usr/bin/supervisord -c /etc/supervisor/conf.d/insight.conf

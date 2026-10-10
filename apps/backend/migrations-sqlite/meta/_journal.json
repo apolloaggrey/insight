@@ -1,0 +1,552 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1768388391105,
+      "tag": "0000_user_auth_and_chat_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1768493382221,
+      "tag": "0001_message_feedback",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1768552721702,
+      "tag": "0002_chat_message_stop_reason_and_error_message",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1768561598427,
+      "tag": "0003_handle_slack_with_thread",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1768817979545,
+      "tag": "0004_input_and_output_tokens",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1769163991907,
+      "tag": "0005_add_project_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1769301411587,
+      "tag": "0006_llm_model_ids",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1769686400000,
+      "tag": "0007_chat_message_llm_info",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1770129133018,
+      "tag": "0008_user_password_reset",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1770285799418,
+      "tag": "0009_organization_level",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1770381609572,
+      "tag": "0010_saved_prompts",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1770819225942,
+      "tag": "0011_add-experimental-agent",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1771512415648,
+      "tag": "0012_chat_message_metadata_and_tool_raw_input",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1771575705677,
+      "tag": "0013_agent_memory",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1771591511059,
+      "tag": "0014_add_enabledMcpTools_and_knownMcpServers_to_project",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1771614350511,
+      "tag": "0015_user_memory_enabled",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1771694141518,
+      "tag": "0016_chat_message_superseded_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1772031581593,
+      "tag": "0017_llm_inference_memory_superseded_by",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1772124770677,
+      "tag": "0018_added_message_part_chart_image",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1772144197644,
+      "tag": "0019_add_stories",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1772640831692,
+      "tag": "0020_bedrock_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1772702832964,
+      "tag": "0021_add_source_chat_message",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1772706229518,
+      "tag": "0022_add_slack_provider",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1773133917020,
+      "tag": "0023_added_microsoft_teams",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1773338645081,
+      "tag": "0024_add_favs",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1773740147271,
+      "tag": "0025_archive_stories",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1773740147400,
+      "tag": "0026_add_log_table",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1774013997070,
+      "tag": "0027_add_shared_chat",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1774262217065,
+      "tag": "0028_add_telegram_channel",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1774271885552,
+      "tag": "0029_add_whatsapp_channel",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1774539602329,
+      "tag": "0030_add_chat_soft_delete",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1774549788607,
+      "tag": "0031_live_stories",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1774873099155,
+      "tag": "0032_add_images",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1775130177344,
+      "tag": "0033_add_whatsapp_links",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1775132290056,
+      "tag": "0034_add_fork_metadata_and_highlight_chats",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "6",
+      "when": 1775740835280,
+      "tag": "0035_add_project_provider_budget",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "6",
+      "when": 1776187665191,
+      "tag": "0036_cloud",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "6",
+      "when": 1776332018682,
+      "tag": "0037_add_citation_column",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "6",
+      "when": 1777983465688,
+      "tag": "0038_scheduling_table",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "6",
+      "when": 1778071303698,
+      "tag": "0039_mcp_endpoint",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "6",
+      "when": 1778541532870,
+      "tag": "0040_branding_config",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "6",
+      "when": 1779179529694,
+      "tag": "0041_automations",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "6",
+      "when": 1779270683577,
+      "tag": "0042_mcp_query_data_and_chart_embed",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "6",
+      "when": 1779278953215,
+      "tag": "0043_custom-models-id",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "6",
+      "when": 1779815381971,
+      "tag": "0044_activity",
+      "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "6",
+      "when": 1779815381972,
+      "tag": "0045_migrate_mcp_endpoint_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "6",
+      "when": 1780403968988,
+      "tag": "0046_folder-management",
+      "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "6",
+      "when": 1781092642363,
+      "tag": "0047_recommendations",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "6",
+      "when": 1781709777049,
+      "tag": "0048_user_preferences",
+      "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "6",
+      "when": 1781711312936,
+      "tag": "0049_add_display_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "6",
+      "when": 1782226391713,
+      "tag": "0050_add_message_version_group_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "6",
+      "when": 1782390602602,
+      "tag": "0051_analytics_event",
+      "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "6",
+      "when": 1782391309531,
+      "tag": "0052_add_brand_color",
+      "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "6",
+      "when": 1783082672684,
+      "tag": "0053_new_mcp",
+      "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "6",
+      "when": 1783278706989,
+      "tag": "0054_webhooks",
+      "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "6",
+      "when": 1783321426739,
+      "tag": "0055_add_gitlab_token",
+      "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "6",
+      "when": 1783697772869,
+      "tag": "0056_model_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 57,
+      "version": "6",
+      "when": 1785435188287,
+      "tag": "0057_map_settings_and_map_embed",
+      "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "6",
+      "when": 1785931695088,
+      "tag": "0058_add_category_rootcause_fixtarget_to_recommendations",
+      "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "6",
+      "when": 1786094927201,
+      "tag": "0059_per_user_budget",
+      "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "6",
+      "when": 1786362945820,
+      "tag": "0060_context_branch_ownership",
+      "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "6",
+      "when": 1786371598947,
+      "tag": "0061_context_branch_review_request",
+      "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "6",
+      "when": 1786544583354,
+      "tag": "0062_storage",
+      "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "6",
+      "when": 1786610518650,
+      "tag": "0063_default_models",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "6",
+      "when": 1787660346891,
+      "tag": "0064_add_mattermost",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "6",
+      "when": 1789474725833,
+      "tag": "0065_user_groups",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "6",
+      "when": 1790001488903,
+      "tag": "0066_notification_system",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "6",
+      "when": 1790175946649,
+      "tag": "0067_llm_inference_created_at_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "6",
+      "when": 1790587020534,
+      "tag": "0068_sandbox_secrets",
+      "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "6",
+      "when": 1790616312708,
+      "tag": "0069_message_sender_user_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "6",
+      "when": 1790691341425,
+      "tag": "0070_shared_story_group_access",
+      "breakpoints": true
+    },
+    {
+      "idx": 71,
+      "version": "6",
+      "when": 1790775933431,
+      "tag": "0071_story_certification",
+      "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "6",
+      "when": 1790932956396,
+      "tag": "0072_custom_stories",
+      "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "6",
+      "when": 1790932957396,
+      "tag": "0073_story_fork_metadata_story_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "6",
+      "when": 1791204013835,
+      "tag": "0074_organization_billing",
+      "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "6",
+      "when": 1791306204428,
+      "tag": "0075_bypass_billing",
+      "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "6",
+      "when": 1791358972255,
+      "tag": "0076_member_budgets",
+      "breakpoints": true
+    },
+    {
+      "idx": 77,
+      "version": "6",
+      "when": 1791614093870,
+      "tag": "0077_database_connections",
+      "breakpoints": true
+    }
+  ]
+}

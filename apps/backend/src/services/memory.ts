@@ -1,0 +1,221 @@
+import type { LlmProvider } from '@insight/shared/types';
+
+import { MemoryExtractorLLM } from '../agents/memory/memory-extractor-llm';
+import { disableModelReasoning, getProviderMeta, type ProviderModelResult } from '../agents/providers';
+import { DBMemory, DBNewMemory } from '../db/abstractSchema';
+import * as llmInferenceQueries from '../queries/llm-inference';
+import * as memoryQueries from '../queries/memory';
+import { TokenUsage } from '../types/chat';
+import type {
+	ExtractorLLMOutput,
+	MemoryCategory,
+	MemoryExtractionOptions,
+	UserInstruction,
+	UserMemory,
+	UserProfile,
+} from '../types/memory';
+import { resolveAnnotationModelId, resolveDefaultModelSelection, resolveProviderModel } from '../utils/llm';
+import { logger } from '../utils/logger';
+import { posthog, PostHogEvent } from './posthog';
+
+/**
+ * Manages persistent user memories: injecting them into agent context and
+ * triggering background extraction after each user message.
+ */
+class MemoryService {
+	/** Safely gets active memories for a user to be injected into the system prompt. */
+	public async safeGetUserMemories(userId: string, projectId: string, excludeChatId?: string): Promise<UserMemory[]> {
+		try {
+			const isEnabled = await this._isMemoryEnabled(userId, projectId);
+			if (!isEnabled) {
+				return [];
+			}
+			const memories = await memoryQueries.getUserMemories(userId, excludeChatId);
+			return memories.map((memory) => ({
+				category: memory.category,
+				content: memory.content,
+			}));
+		} catch (err) {
+			logger.error(`Memory injection failed: ${String(err)}`, {
+				source: 'agent',
+				context: { userId, projectId },
+			});
+			return [];
+		}
+	}
+
+	/** Safely schedules memory extraction for a user message. */
+	public safeScheduleMemoryExtraction(opts: MemoryExtractionOptions) {
+		this._extractMemory(opts).catch((err) => {
+			logger.error(`Memory extraction failed: ${String(err)}`, {
+				source: 'agent',
+				projectId: opts.projectId,
+				context: { chatId: opts.chatId, userId: opts.userId },
+			});
+		});
+	}
+
+	private async _extractMemory(opts: MemoryExtractionOptions): Promise<void> {
+		const isEnabled = await this._isMemoryEnabled(opts.userId, opts.projectId);
+		if (!isEnabled) {
+			return;
+		}
+
+		const pinned = await resolveDefaultModelSelection(opts.projectId, 'other');
+		const provider = pinned?.provider ?? opts.provider;
+		const modelId =
+			pinned?.modelId ?? (await this._getExtractorModelId(opts.projectId, opts.provider, opts.modelId));
+		const model = await this._resolveModel(opts.projectId, provider, modelId);
+		if (!model) {
+			return;
+		}
+
+		const existingMemories = await memoryQueries.getUserMemories(opts.userId);
+		const extractor = new MemoryExtractorLLM(model);
+		const extractorResult = await extractor.extract(existingMemories, opts.messages);
+		if (!extractorResult) {
+			return;
+		}
+
+		const { newCount, supersededCount } = await this._persistExtractedMemories({
+			userId: opts.userId,
+			chatId: opts.chatId,
+			existingMemories,
+			extractedMemories: extractorResult.output,
+		});
+
+		this._trackMemoryExtraction({
+			...opts,
+			provider,
+			modelId,
+			usage: extractorResult.usage,
+			newCount,
+			supersededCount,
+		});
+
+		await this._saveInferenceRecord({
+			...opts,
+			provider,
+			modelId,
+			usage: extractorResult.usage,
+		});
+	}
+
+	private async _resolveModel(
+		projectId: string,
+		provider: LlmProvider,
+		modelId: string,
+	): Promise<ProviderModelResult | null> {
+		const model = await resolveProviderModel(projectId, provider, modelId, false);
+		return model ? disableModelReasoning(provider, model) : null;
+	}
+
+	private async _getExtractorModelId(
+		projectId: string,
+		provider: LlmProvider,
+		selectedModelId: string,
+	): Promise<string> {
+		return resolveAnnotationModelId(
+			projectId,
+			{ provider, modelId: selectedModelId },
+			getProviderMeta(provider).extractorModelId,
+		);
+	}
+
+	private async _persistExtractedMemories(opts: {
+		userId: string;
+		chatId: string;
+		existingMemories: DBMemory[];
+		extractedMemories: ExtractorLLMOutput;
+	}): Promise<{ newCount: number; supersededCount: number }> {
+		const existingIds = new Set(opts.existingMemories.map((m) => m.id));
+		const instructions = opts.extractedMemories.user_instructions ?? [];
+		const profile = opts.extractedMemories.user_profile ?? [];
+
+		const newDbMemories = [
+			...this._toDbMemories(instructions, 'global_rule', opts.userId, opts.chatId),
+			...this._toDbMemories(profile, 'personal_fact', opts.userId, opts.chatId),
+		].filter(({ supersedesId }) => (supersedesId ? existingIds.has(supersedesId) : true));
+
+		if (newDbMemories.length) {
+			await memoryQueries.upsertAndSupersedeMemories(newDbMemories);
+		}
+
+		const supersededCount = newDbMemories.filter((m) => m.supersedesId).length;
+		return { newCount: newDbMemories.length - supersededCount, supersededCount };
+	}
+
+	private _toDbMemories(
+		items: (UserInstruction | UserProfile)[],
+		category: MemoryCategory,
+		userId: string,
+		chatId: string,
+	): (DBNewMemory & { supersedesId?: string | null })[] {
+		return items
+			.map((item) => {
+				const content = this.normalizeMemoryContent(item.content);
+				if (!content) {
+					return;
+				}
+				return {
+					userId,
+					content,
+					category,
+					chatId,
+					supersedesId: item.supersedes_id,
+				};
+			})
+			.filter((m) => m !== undefined);
+	}
+
+	public normalizeMemoryContent(content: string): string {
+		const normalized = content.trim().replace(/\s+/g, ' ');
+		if (normalized.length === 0) {
+			return normalized;
+		}
+		return /[.!?]$/.test(normalized) ? normalized : `${normalized}.`;
+	}
+
+	private _trackMemoryExtraction(
+		opts: MemoryExtractionOptions & {
+			modelId: string;
+			usage: TokenUsage;
+			newCount: number;
+			supersededCount: number;
+		},
+	) {
+		posthog.capture(opts.userId, PostHogEvent.AgentMemoryExtractionCompleted, {
+			project_id: opts.projectId,
+			chat_id: opts.chatId,
+			model_id: opts.modelId,
+			provider: opts.provider,
+			input_tokens: opts.usage.inputTotalTokens,
+			output_tokens: opts.usage.outputTotalTokens,
+			new_memories_count: opts.newCount,
+			superseded_memories_count: opts.supersededCount,
+		});
+	}
+
+	private async _saveInferenceRecord(
+		opts: MemoryExtractionOptions & {
+			modelId: string;
+			usage: TokenUsage;
+		},
+	): Promise<void> {
+		await llmInferenceQueries.insertLlmInference({
+			projectId: opts.projectId,
+			userId: opts.userId,
+			chatId: opts.chatId,
+			type: 'memory_extraction',
+			llmProvider: opts.provider,
+			llmModelId: opts.modelId,
+			...opts.usage,
+		});
+	}
+
+	private async _isMemoryEnabled(userId: string, projectId: string): Promise<boolean> {
+		return memoryQueries.getIsMemoryEnabledForUserAndProject(userId, projectId);
+	}
+}
+
+export const memoryService = new MemoryService();

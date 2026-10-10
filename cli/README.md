@@ -1,0 +1,382 @@
+# Insight CLI
+
+Command-line interface for insight chat.
+
+## Installation
+
+Install the core package (lightweight, no database or LLM dependencies):
+
+```bash
+pip install insight-core
+```
+
+Then add only the providers you need:
+
+```bash
+# Database backends
+pip install 'insight-core[postgres]'
+pip install 'insight-core[bigquery]'
+pip install 'insight-core[snowflake]'
+pip install 'insight-core[duckdb]'
+pip install 'insight-core[clickhouse]'
+pip install 'insight-core[databricks]'
+pip install 'insight-core[mysql]'
+pip install 'insight-core[mssql]'
+pip install 'insight-core[athena]'
+pip install 'insight-core[trino]'
+pip install 'insight-core[redshift]'
+pip install 'insight-core[fabric]'
+pip install 'insight-core[starrocks]'
+
+# LLM providers
+pip install 'insight-core[openai]'
+pip install 'insight-core[anthropic]'
+pip install 'insight-core[mistral]'
+pip install 'insight-core[gemini]'
+pip install 'insight-core[ollama]'
+
+# Integrations
+pip install 'insight-core[notion]'
+
+# Semantic layer (dbt MetricFlow)
+pip install 'insight-core[semantic-layer]'
+```
+
+Obsidian support is included in the core package and does not require an extra.
+
+Combine multiple extras in a single install:
+
+```bash
+pip install 'insight-core[postgres,openai]'
+pip install 'insight-core[snowflake,bigquery,anthropic]'
+```
+
+Or install everything at once (equivalent to the previous default):
+
+```bash
+pip install 'insight-core[all]'
+```
+
+Convenience groups are also available:
+
+```bash
+pip install 'insight-core[all-databases]'  # all database backends
+pip install 'insight-core[all-llms]'       # all LLM providers
+```
+
+## Usage
+
+```bash
+insight --help
+Usage: Insight COMMAND
+
+╭─ Commands ────────────────────────────────────────────────────────────────╮
+│ chat         Start the insight chat UI.                                       │
+│ debug        Test connectivity to configured resources.                   │
+│ init         Initialize a new Insight project.                                │
+│ sync         Sync resources to local files.                               │
+│ test         Run and explore Insight tests.                                   │
+│ --help (-h)  Display this message and exit.                               │
+│ --version    Display application version.                                 │
+╰───────────────────────────────────────────────────────────────────────────╯
+```
+
+### Initialize a new Insight project
+
+```bash
+insight init
+```
+
+This will create a new Insight project in the current directory. It will prompt you for a project name and ask you to configure:
+
+- **Database connections** (BigQuery, DuckDB, MotherDuck, DuckLake, Databricks, Snowflake, PostgreSQL, Redshift, MSSQL, Trino, StarRocks)
+- **Git repositories** to sync
+- **LLM provider** (OpenAI, Anthropic, Mistral, Gemini, OpenRouter, Requesty, Ollama)
+- **`ai_summary` template + model** (prompted only when you enable `ai_summary` for databases)
+- **Slack integration**
+- **Notion integration**
+
+The resulting project structure looks like:
+
+```
+<project>/
+├── insight_config.yaml
+├── .insightignore
+├── RULES.md
+├── databases/
+├── queries/
+├── docs/
+├── semantics/
+├── repos/
+├── agent/
+│   ├── tools/
+│   └── mcps/
+└── tests/
+```
+
+Options:
+
+- `--force` / `-f`: Force re-initialization even if the project already exists
+- `--yes` / `-y` / `--no-tty`: Run non-interactively. Skips all prompts and uses sensible defaults — useful for AI agents and automation scripts. When combined with a pre-written `insight_config.yaml` (e.g. written by an agent skill), only scaffolds the folder structure.
+- `--name` / `-n`: Project name. When set without an existing `insight_config.yaml`, this is used as the project name (and folder). In `--yes` mode without `--name`, the current directory name is used and the project is initialized in place.
+
+#### Non-interactive (agent-friendly) mode
+
+For LLM agents and automation, run `insight init` without any prompts:
+
+```bash
+# Initialize the current directory as an Insight project (uses the directory name)
+insight init --yes
+
+# Or create a new sub-folder named "my-project"
+insight init --yes --name my-project
+
+# Pre-write insight_config.yaml then scaffold folders without prompting
+cat > insight_config.yaml <<'YAML'
+project_name: my-project
+databases:
+  - type: duckdb
+    name: local
+    path: ":memory:"
+YAML
+insight init --yes
+
+# MotherDuck (DuckDB-compatible cloud) — token via env recommended
+cat > insight_config.yaml <<'YAML'
+project_name: my-project
+databases:
+  - type: motherduck
+    name: md-analytics
+    database: my_db
+    token: "{{ env('MOTHERDUCK_TOKEN') }}"
+YAML
+insight init --yes
+
+# DuckLake — a postgres or mysql catalog is recommended for concurrent access;
+# file-based catalogs (duckdb/sqlite) allow only a single connection at a time.
+# The session denies local filesystem and network access once the lake is
+# attached, so queries can only read the configured lake, not arbitrary files.
+cat > insight_config.yaml <<'YAML'
+project_name: my-project
+databases:
+  - type: ducklake
+    name: lake
+    catalog:
+      type: postgres
+      host: localhost
+      port: 5432
+      database: ducklake_catalog
+      user: "{{ env('DUCKLAKE_CATALOG_USER') }}"
+      password: "{{ env('DUCKLAKE_CATALOG_PASSWORD') }}"
+    data_path: "s3://my-bucket/lake/"
+    storage:
+      type: s3
+      key_id: "{{ env('AWS_ACCESS_KEY_ID') }}"
+      secret: "{{ env('AWS_SECRET_ACCESS_KEY') }}"
+      region: eu-west-1
+YAML
+insight init --yes
+```
+
+In non-interactive mode, `insight init` never asks for input. Configure databases, LLM provider, and integrations by editing `insight_config.yaml` directly (or by pre-writing it before `insight init`).
+
+### Start the insight chat UI
+
+```bash
+insight chat
+```
+
+This will start the insight chat UI. It will open the chat interface in your browser at `http://localhost:5005`.
+
+To let the agent run code in a micro-VM, download the sandbox runtime once with `insight chat --sandbox`, then enable
+Sandboxes in Settings → Experimental. The runtime and the DuckDB engine used by `insight test` are ~100 MB each, so they
+are not shipped in the package: Insight fetches them on first use and caches them in `~/.insight/native`. Set
+`INSIGHT_NATIVE_REGISTRY` to download them from an npm mirror instead of `registry.npmjs.org`.
+
+### Test connectivity
+
+```bash
+insight debug
+```
+
+Tests connectivity to all configured databases and LLM providers. Displays a summary table showing connection status and details for each resource.
+
+### Sync resources
+
+```bash
+insight sync
+```
+
+Syncs configured resources to local files:
+
+- **Databases** - generates configured markdown docs for each table into `databases/` (`columns.md` and `preview.md` by default; optional `profiling.md`, `query_history.md`, and `ai_summary.md`)
+- **Git repositories** — clones or pulls repos into `repos/`
+- **Notion pages** — exports pages as markdown into `docs/notion/`. Databases are exported as markdown tables, whether configured directly or embedded inline in a page. A database embedded in a page is exported through one of its views — Notion exposes no way to tell which view a page renders, so the first one listed is used — applying that view's filters, sorts and visible columns rather than dumping the whole data source. A database configured by URL exports every row and column, unless the URL carries `?v=<view_id>`, in which case that view applies. When a database cannot be exported, its page fails to sync and the previously synced markdown is left untouched, rather than being rewritten without its table.
+- **Obsidian notes** — copies markdown notes from a local vault into `docs/obsidian/`, skipping hidden folders such as `.obsidian/` and `.trash/`
+
+After syncing, any Jinja templates (`*.j2` files) in the project directory are rendered with the Insight context.
+
+Optional `ai_summary` generation:
+
+- Add `ai_summary` to a database connection `templates` list to render `ai_summary.md`.
+- AI summaries use profiling statistics for data-quality and distribution observations. The row preview is a tiny, non-representative shape sample.
+- Use `prompt("...")` inside Jinja templates to generate `ai_summary` content.
+- `prompt(...)` requires an `llm.providers` entry with an `api_key` (except for ollama), plus `llm.annotation_model`.
+- Configure `profiling` and `ai_summary` refreshes independently with `refresh_policy: always`, `once`, or `interval`. Interval policies also accept `interval_days` (default: `7`):
+
+```yaml
+databases:
+    - type: duckdb
+      name: analytics
+      path: analytics.duckdb
+      templates: [columns, preview, profiling, ai_summary]
+      profiling:
+          refresh_policy: once
+      ai_summary:
+          refresh_policy: interval
+          interval_days: 7
+```
+
+### Log in
+
+```bash
+insight login
+```
+
+Connects the CLI to your Insight account: it opens the app in your browser, asks you to approve the CLI, and stores the resulting session. Commands that talk to the backend (like `insight test`) trigger the same browser flow automatically when you are not logged in yet, and fall back to an email/password prompt when no browser is available. Use `Insight logout` to revoke the stored session.
+
+### Run tests
+
+```bash
+insight test
+```
+
+Runs test cases defined as YAML files in `tests/`. Each test has a `name`, `prompt`, and optional expected `sql` and/or `assertions`. Results are saved to `tests/outputs/`.
+
+Final-output checks use reference `sql` (dataframe equality). Intermediate agent actions use `assertions` against the run's tool-call trace — for example, requiring a clarifying follow-up:
+
+```yaml
+name: ambiguous_revenue_period
+prompt: What was the revenue?
+assertions:
+  - type: tool_call
+    tool: clarification
+```
+
+`tool_call` assertions can also require a specific tool (e.g. `execute_sql`), optional arg subset match via `args` (omit it to match any call; an empty mapping is rejected), and `min_count`. SQL verification and assertions can be combined; the run passes only if every check passes. A test file with an invalid `assertions` block fails the whole run instead of being skipped.
+
+Options:
+
+- `--model` / `-m`: Models to test against (default: `openai:gpt-4.1`). Can be specified multiple times.
+- `--threads` / `-t`: Number of parallel threads (default: `1`)
+- `--k` / `-k`: Number of times to run each test case, used to compute pass@k and pass^k (default: `1`)
+- `--select` / `-s`: Run only selected tests by name, yaml stem, or subfolder. Comma-separated.
+- `--username` / `-u`, `--password`: Credentials for the Insight backend, for non-interactive runs. Fall back to `INSIGHT_USERNAME` / `INSIGHT_PASSWORD`. When omitted, the CLI uses your stored login or opens the browser login flow.
+
+Examples:
+
+```bash
+insight test -m openai:gpt-4.1
+insight test -m openai:gpt-4.1 -m anthropic:claude-sonnet-4-20250514
+insight test --threads 4
+insight test --k 5
+```
+
+Defaults for every run live in the `test` block of `insight_config.yaml`, and the `--model` / `--threads` / `--k` flags override them:
+
+```yaml
+test:
+    models:
+        - openai:gpt-4.1
+        - anthropic:claude-sonnet-4-5
+    threads: 4
+    # k: 5  # run each case 5 times to compute pass@k / pass^k
+    comparison:
+        rtol: 0.00001
+        atol: 0.00000001
+        decimals: 2
+```
+
+### Explore test results
+
+```bash
+insight test server
+```
+
+Starts a local web server to explore test results in a browser UI showing pass/fail status, token usage, cost, and detailed data comparisons.
+
+Options:
+
+- `--port` / `-p`: Port to run the server on (default: `8765`)
+- `--no-open`: Don't automatically open the browser
+
+### BigQuery service account permissions
+
+When you connect BigQuery during `insight init`, the service account used by `credentials_path`/ADC must be able to list datasets and run read-only queries to generate docs. Grant the account:
+
+- Project: `roles/bigquery.jobUser` (or `roles/bigquery.user`) so the CLI can submit queries
+- Each dataset you sync: `roles/bigquery.dataViewer` (or higher) to read tables
+
+The combination above mirrors the typical "BigQuery User" setup and is sufficient for Insight's metadata and preview pulls.
+
+### Snowflake authentication
+
+Snowflake supports three authentication methods during `insight init`:
+
+- **SSO**: Browser-based authentication (recommended for organizations with SSO policies)
+- **Password**: Traditional username/password
+- **Key-pair**: Private key file with optional passphrase
+
+## Development
+
+### Building the package
+
+```bash
+cd cli
+python build.py --help
+Usage: build.py [OPTIONS]
+
+Build and package insight-core CLI.
+
+╭─ Parameters ──────────────────────────────────────────────────────────────────╮
+│ --force -f --no-force              Force rebuild the server binary             │
+│ --skip-server -s --no-skip-server  Skip server build, only build Python pkg   │
+│ --bump                             Bump version (patch, minor, major)          │
+╰───────────────────────────────────────────────────────────────────────────────╯
+```
+
+This will:
+
+1. Build the frontend with Vite
+2. Compile the backend with Bun into a standalone binary
+3. Bundle everything into a Python wheel in `dist/`
+
+### Installing for development
+
+```bash
+cd cli
+pip install -e '.[all]'
+```
+
+### Publishing to PyPI
+
+```bash
+# Build first
+python build.py
+
+# Publish
+uv publish dist/*
+```
+
+## Architecture
+
+```
+insight chat (CLI command)
+    ↓ spawns
+insight-chat-server (Bun-compiled binary, port 5005)
+  + FastAPI server (port 8005)
+    ↓ serves
+Backend API + Frontend Static Files
+    ↓
+Browser at http://localhost:5005
+```

@@ -1,0 +1,516 @@
+"""Base database context exposing methods available in templates during sync."""
+
+from __future__ import annotations
+
+import fnmatch
+from datetime import date, datetime, timezone
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ibis import BaseBackend
+
+
+class DatabaseContext:
+    """Context object passed to Jinja2 templates during database sync.
+
+    Exposes data-fetching methods that templates can call to retrieve
+    column metadata, row previews, table descriptions, etc.
+
+    Subclasses override description(), columns(), and partition_columns()
+    to fetch warehouse-specific metadata (e.g. BigQuery partition info).
+    """
+
+    def __init__(
+        self,
+        conn: BaseBackend,
+        schema: str,
+        table_name: str,
+        exclude_columns: list[str] | None = None,
+    ):
+        self._conn = conn
+        self._schema = schema
+        self._table_name = table_name
+        self._exclude_columns = list(exclude_columns) if exclude_columns else []
+        self._table_ref = None
+        self._columns_cache: list[dict[str, Any]] | None = None
+        self._columns_load_failed = False
+        self._row_count_cache: int | None = None
+
+    def set_exclude_columns(self, patterns: list[str] | None) -> None:
+        """Set the list of glob patterns used to hide columns from the agent.
+
+        Patterns are matched against the fully-qualified ``schema.table.column``
+        name. Subclasses build their own column metadata; calling this lets the
+        sync provider thread the user-configured ``exclude_columns`` into any
+        context implementation without changing per-database constructors.
+        """
+        self._exclude_columns = list(patterns) if patterns else []
+
+    def _is_column_excluded(self, column_name: str) -> bool:
+        """Return True when the column should be hidden based on ``exclude_columns``.
+
+        Patterns are matched against the fully-qualified ``schema.table.column``
+        name using shell-style globs.
+        """
+        if not self._exclude_columns:
+            return False
+        full_name = f"{self._schema}.{self._table_name}.{column_name}"
+        return any(fnmatch.fnmatch(full_name, pattern) for pattern in self._exclude_columns)
+
+    def _filter_excluded_columns(self, cols: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop columns whose name matches an ``exclude_columns`` pattern."""
+        if not self._exclude_columns:
+            return cols
+        return [col for col in cols if not self._is_column_excluded(str(col.get("name", "")))]
+
+    def _filter_excluded_names(self, names: list[str]) -> list[str]:
+        """Drop column names that match an ``exclude_columns`` pattern."""
+        if not self._exclude_columns:
+            return names
+        return [name for name in names if not self._is_column_excluded(name)]
+
+    @property
+    def table(self):
+        if self._table_ref is None:
+            self._table_ref = self._conn.table(self._table_name, database=self._schema)
+        return self._table_ref
+
+    def columns(self) -> list[dict[str, Any]]:
+        if self._columns_cache is None:
+            schema = self.table.schema()
+            self._columns_cache = [
+                {
+                    "name": name,
+                    "type": (raw[1:] + " NOT NULL" if (raw := str(dtype)).startswith("!") else raw),
+                    "nullable": dtype.nullable if hasattr(dtype, "nullable") else True,
+                    "description": None,
+                }
+                for name, dtype in schema.items()
+            ]
+        return self._filter_excluded_columns(self._columns_cache)
+
+    def all_columns(self) -> list[dict[str, Any]] | None:
+        if self._columns_cache is None:
+            self._columns_load_failed = False
+            try:
+                self.columns()
+            except Exception:
+                self._columns_load_failed = True
+                return None
+        if self._columns_load_failed:
+            return None
+        return self._columns_cache if self._columns_cache is not None else []
+
+    def row_count(self) -> int:
+        if self._row_count_cache is None:
+            self._row_count_cache = self.table.count().execute()
+        return self._row_count_cache
+
+    def column_count(self) -> int:
+        return len(self.columns())
+
+    def preview(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Return the first N rows as a list of dictionaries."""
+        df = self.table.limit(limit).execute()
+        rows = []
+        for _, row in df.iterrows():
+            row_dict = row.to_dict()
+            for key, val in row_dict.items():
+                if val is not None and not isinstance(val, (str, int, float, bool, list, dict)):
+                    row_dict[key] = str(val)
+            rows.append(self._filter_excluded_row(row_dict))
+        return rows
+
+    def _filter_excluded_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Drop keys from a preview row that match an ``exclude_columns`` pattern."""
+        if not self._exclude_columns:
+            return row
+        return {key: val for key, val in row.items() if not self._is_column_excluded(str(key))}
+
+    def partition_columns(self) -> list[str]:
+        """Return partition column names if available."""
+        return []
+
+    def clustering_columns(self) -> list[str]:
+        """Return clustering column names if available."""
+        return []
+
+    def is_partitioned(self) -> bool:
+        """Return True if this table has a partition column."""
+        return False
+
+    def requires_partition_filter(self) -> bool:
+        """Return True if queries to this table require a partition filter."""
+        return False
+
+    def active_partition_filter(self) -> str | None:
+        """Return the partition filter expression for this table, if any."""
+        return None
+
+    def description(self) -> str | None:
+        """Return the table description if available."""
+        return None
+
+    def indexes(self) -> str | None:
+        """Return index/ordering key information if available (e.g. ORDER BY, PRIMARY KEY, indexes).
+        Used by table metadata templates so the agent knows how the table is indexed for querying.
+        """
+        return None
+
+    def profiling(self) -> dict[str, Any] | None:
+        """Return profiling data for the table."""
+        try:
+            cols = self.columns()
+            if not cols:
+                return None
+            total_count = self.row_count()
+        except Exception:
+            return None
+
+        profiles = []
+        for col in cols:
+            try:
+                if self._is_complex_type_column(col):
+                    profile = self._profile_complex_type_column(col, total_count)
+                else:
+                    profile = self._profile_standard_column(col, total_count)
+                if profile:
+                    profiles.append(profile)
+            except Exception:
+                continue
+
+        clustering_columns = []
+        try:
+            clustering_columns = self.clustering_columns()
+        except Exception:
+            pass
+
+        return {
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+            "clustering_columns": clustering_columns,
+            "columns": profiles,
+        }
+
+    def _profile_standard_column(self, col: dict, total_count: int) -> dict[str, Any] | None:
+        col_type = self._normalize_type(col["type"])
+        is_numeric = self._is_numeric_stats_column(col)
+        is_date = any(t in col_type.lower() for t in ("date", "timestamp", "time"))
+
+        query = self._build_profiling_query(col)
+        row = self._fetchone(self._conn.raw_sql(query))  # type: ignore[union-attr]
+        if not row:
+            return None
+
+        profile = self._parse_profiling_row(row, col, total_count)
+
+        distinct_count = profile["distinct_count"]
+        if distinct_count and distinct_count <= 50 and not is_numeric and not is_date:
+            top_vals = self._fetch_top_values(col)
+            if top_vals:
+                profile["top_values"] = top_vals
+
+        return profile
+
+    def _profile_complex_type_column(self, col: dict, total_count: int) -> dict[str, Any] | None:
+        """Profile a complex type column (array, struct, map, json, tuple, variant, …).
+
+        Always computes null_count. Then enriches with distinct_count and top_values
+        following this priority:
+          1. array type  + _array_unnest_join → element-level distinct count + top values via UNNEST
+          2. any complex + _cast_complex_to_string → distinct count + top values via string cast
+          3. otherwise   → null_count only
+        """
+        col_sql = self._quote(col["name"])
+        col_type = col["type"].lower()
+        table_sql = self._qualified_table_sql()
+        partition_filter = self._partition_filter()
+        where_clause = f"WHERE {partition_filter}" if partition_filter else ""
+
+        query = f"SELECT {self._null_count_sql(col_sql)} AS null_count FROM {table_sql} {where_clause}".strip()
+        row = self._fetchone(self._conn.raw_sql(query))  # type: ignore[union-attr]
+        if not row:
+            return None
+
+        null_count = int(row[0] or 0)
+        profile: dict[str, Any] = {
+            "column": col["name"],
+            "type": self._normalize_type(col["type"]),
+            "total_count": total_count,
+            "null_count": null_count,
+            "null_percentage": round(null_count / total_count * 100, 2) if total_count else None,
+            "distinct_count": None,
+        }
+
+        unnest_from = self._array_unnest_join(table_sql, col_sql, "val") if self._is_array_type(col_type) else None
+
+        if unnest_from:
+            base_conditions = [partition_filter] if partition_filter else []
+            base_where = f"WHERE {' AND '.join(base_conditions)}" if base_conditions else ""
+            val_where = "WHERE " + " AND ".join(base_conditions + ["val IS NOT NULL"])
+            try:
+                row = self._fetchone(
+                    self._conn.raw_sql(  # type: ignore[union-attr]
+                        f"SELECT COUNT(DISTINCT val) FROM {unnest_from} {base_where}".strip()
+                    )
+                )
+                if row and row[0] is not None:
+                    profile["distinct_count"] = int(row[0])
+            except Exception:
+                pass
+            if profile["distinct_count"] and profile["distinct_count"] <= 50:
+                try:
+                    rows = self._fetchall(
+                        self._conn.raw_sql(  # type: ignore[union-attr]
+                            f"SELECT val, COUNT(*) AS cnt FROM {unnest_from} {val_where} "
+                            f"GROUP BY val ORDER BY cnt DESC, val ASC LIMIT 10".strip()
+                        )
+                    )
+                    top_vals = [
+                        {"value": self._json_safe_value(r[0]), "count": int(r[1])} for r in rows if r[0] is not None
+                    ]
+                    if top_vals:
+                        profile["top_values"] = top_vals
+                except Exception:
+                    pass
+        else:
+            string_expr = self._cast_complex_to_string(col_sql)
+            if string_expr:
+                try:
+                    row = self._fetchone(
+                        self._conn.raw_sql(  # type: ignore[union-attr]
+                            f"SELECT COUNT(DISTINCT {string_expr}) FROM {table_sql} {where_clause}".strip()
+                        )
+                    )
+                    if row and row[0] is not None:
+                        profile["distinct_count"] = int(row[0])
+                except Exception:
+                    pass
+                if profile["distinct_count"] and profile["distinct_count"] <= 50:
+                    try:
+                        conditions = [partition_filter] if partition_filter else []
+                        conditions.append(f"{string_expr} IS NOT NULL")
+                        top_where = "WHERE " + " AND ".join(conditions)
+                        rows = self._fetchall(
+                            self._conn.raw_sql(  # type: ignore[union-attr]
+                                f"SELECT {string_expr} AS val, COUNT(*) AS cnt FROM {table_sql} {top_where} "
+                                f"GROUP BY {string_expr} ORDER BY COUNT(*) DESC, {string_expr} ASC LIMIT 10".strip()
+                            )
+                        )
+                        top_vals = [
+                            {"value": self._json_safe_value(r[0]), "count": int(r[1])} for r in rows if r[0] is not None
+                        ]
+                        if top_vals:
+                            profile["top_values"] = top_vals
+                    except Exception:
+                        pass
+
+        return profile
+
+    # ─── SQL primitives ───────────────────────────────────────────────────────
+
+    def _quote(self, name: str) -> str:
+        return f'"{name}"'
+
+    def _cast_float(self, expr: str) -> str:
+        return f"CAST({expr} AS DOUBLE)"
+
+    def _stddev(self, expr: str) -> str:
+        return f"STDDEV_POP({expr})"
+
+    def _partition_filter(self) -> str:
+        return ""
+
+    def _distinct_count_sql(self, col_sql: str) -> str:
+        """How to express COUNT(DISTINCT col) — overridable for MSSQL."""
+        return f"COUNT(DISTINCT {col_sql})"
+
+    def _array_unnest_join(self, table_sql: str, col_sql: str, alias: str) -> str | None:
+        """Return the FROM clause for unnesting an array column, or None if unsupported."""
+        return None
+
+    def _cast_complex_to_string(self, col_sql: str) -> str | None:
+        """Return an expression casting a complex type to string for distinct count, or None if unsupported."""
+        return None
+
+    def _null_count_sql(self, col_sql: str) -> str:
+        return f"COUNT(*) - COUNT({col_sql})"
+
+    def _qualified_table_sql(self) -> str:
+        """Return the schema-qualified, quoted table reference used in raw SQL.
+
+        Overridden by contexts whose ``schema`` carries extra structure the base
+        two-part form can't express (e.g. a catalog-qualified DuckLake schema, or
+        StarRocks' catalog.schema.table).
+        """
+        return f"{self._quote(self._schema)}.{self._quote(self._table_name)}"
+
+    # ─── query builders ───────────────────────────────────────────────────────
+
+    def _numeric_agg_fragments(self, col_sql: str, col: dict) -> list[tuple[str, str]]:
+        """Return (alias, expression) pairs for numeric/date aggregates."""
+        col_type = self._normalize_type(col["type"])
+        is_numeric = self._is_numeric_stats_column(col)
+        is_date = any(t in col_type.lower() for t in ("date", "timestamp", "time"))
+
+        frags = []
+        if is_numeric or is_date:
+            frags.append(("col_min", f"MIN({col_sql})"))
+            frags.append(("col_max", f"MAX({col_sql})"))
+        if is_numeric:
+            frags.append(("col_mean", f"AVG({self._cast_float(col_sql)})"))
+            frags.append(("col_stddev", f"{self._stddev(self._cast_float(col_sql))}"))
+        return frags
+
+    def _build_profiling_query(self, col: dict) -> str:
+        col_sql = self._quote(col["name"])
+        table_sql = self._qualified_table_sql()
+
+        partition_filter = self._partition_filter()
+        where_clause = f"WHERE {partition_filter}" if partition_filter else ""
+
+        frags = self._numeric_agg_fragments(col_sql, col)
+        extra_aggs = "".join(f"\n    , {expr} AS {alias}" for alias, expr in frags)
+
+        return f"""
+            SELECT
+                {self._null_count_sql(col_sql)} AS null_count,
+                {self._distinct_count_sql(col_sql)} AS distinct_count{extra_aggs}
+            FROM {table_sql}
+            {where_clause}
+        """.strip()
+
+    def _build_top_values_query(self, col: dict) -> str:
+        col_sql = self._quote(col["name"])
+        table_sql = self._qualified_table_sql()
+        partition_filter = self._partition_filter()
+        where_clause = f"WHERE {partition_filter}" if partition_filter else ""
+        return f"""
+            SELECT {col_sql} AS value, COUNT(*) AS cnt
+            FROM {table_sql}
+            {where_clause}
+            GROUP BY {col_sql}
+            ORDER BY cnt DESC, {col_sql} ASC
+            LIMIT 10
+        """.strip()
+
+    # ─── result fetching ──────────────────────────────────────────────────────
+
+    def _fetchone(self, result) -> tuple | None:
+        """Normalise raw_sql() results across drivers."""
+        if hasattr(result, "__iter__") and not hasattr(result, "fetchone"):
+            rows = list(result)
+            return tuple(rows[0].values()) if rows else None
+        return result.fetchone()
+
+    def _fetchall(self, result) -> list[tuple]:
+        """Normalise raw_sql() results across drivers."""
+        if hasattr(result, "__iter__") and not hasattr(result, "fetchall"):
+            return [tuple(row.values()) for row in result]
+        return result.fetchall()
+
+    def _fetch_top_values(self, col: dict) -> list[dict]:
+        query = self._build_top_values_query(col)
+        try:
+            rows = self._fetchall(self._conn.raw_sql(query))  # type: ignore[union-attr]
+            return [
+                {"value": self._json_safe_value(r[0]), "count": int(r[1])}
+                for r in rows
+                if r[0] is not None and r[0] != ""
+            ]
+        except Exception:
+            return []
+
+    # ─── parsing ──────────────────────────────────────────────────────────────
+
+    def _parse_profiling_row(self, row, col: dict, total_count: int) -> dict[str, Any]:
+        col_type = self._normalize_type(col["type"])
+        is_numeric = self._is_numeric_stats_column(col)
+        is_date = any(t in col_type.lower() for t in ("date", "timestamp", "time"))
+
+        null_count = int(row[0] or 0)
+        distinct_count = int(row[1] or 0)
+
+        profile: dict[str, Any] = {
+            "column": col["name"],
+            "type": col_type,
+            "total_count": total_count,
+            "null_count": null_count,
+            "null_percentage": round(null_count / total_count * 100, 2) if total_count else None,
+            "distinct_count": distinct_count,
+        }
+
+        if is_date:
+            if row[2] is not None:
+                profile["min"] = self._format_date_value(row[2])
+            if row[3] is not None:
+                profile["max"] = self._format_date_value(row[3])
+        if is_numeric:
+            if row[2] is not None:
+                profile["min"] = str(row[2]) if is_date else row[2]
+            if row[3] is not None:
+                profile["max"] = str(row[3]) if is_date else row[3]
+            if row[4] is not None:
+                profile["mean"] = round(float(row[4]), 4)
+            if row[5] is not None:
+                profile["stddev"] = round(float(row[5]), 4)
+
+        return profile
+
+    def _format_date_value(self, val):
+        if val is None:
+            return None
+        if hasattr(val, "item"):
+            try:
+                val = val.item()
+            except Exception:
+                pass
+        if isinstance(val, date):
+            return f"{val.isoformat()} 00:00:00"
+        try:
+            from dateutil.parser import parse
+
+            return parse(str(val)).isoformat()
+        except Exception:
+            return str(val)
+
+    # ─── type helpers ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_type(col_type: str) -> str:
+        normalized = col_type.removesuffix(" NOT NULL")
+        lowered = normalized.lower()
+        if lowered.startswith("string(") and normalized.endswith(")"):
+            return "string"
+        return normalized
+
+    @staticmethod
+    def _is_complex_type_column(col: dict) -> bool:
+        """Return True for column types that require specialised profiling."""
+        col_type = col["type"].lower()
+        return col_type.startswith(("array", "struct", "map", "json", "row", "tuple", "variant", "object", "super"))
+
+    @staticmethod
+    def _is_array_type(col_type: str) -> bool:
+        """Return True only for array types — the only ones where element-level unnesting applies."""
+        return col_type.startswith("array")
+
+    @staticmethod
+    def _is_numeric_stats_column(col: dict) -> bool:
+        col_type = col["type"]
+        is_numeric = any(t in col_type.lower() for t in ("int", "float", "decimal", "numeric", "double"))
+        is_integer = any(t in col_type.lower() for t in ("int", "integer"))
+        return is_numeric and not (is_integer and col["name"].lower().endswith("_id") and col["name"].lower() != "id")
+
+    @staticmethod
+    def _json_safe_value(value: Any) -> Any:
+        if value is None:
+            return None
+        item = getattr(value, "item", None)
+        if callable(item):
+            try:
+                value = item()
+            except Exception:
+                pass
+        if isinstance(value, (str, int, float, bool, list, dict)):
+            return value
+        return str(value)

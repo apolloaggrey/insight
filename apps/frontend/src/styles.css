@@ -1,0 +1,1002 @@
+@layer theme, base, components, utilities;
+@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@100..900&family=Geist:wght@100..900&display=swap')
+layer(base);
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import './styles.animations.css';
+@import './styles.custom-story-thumbnail.css';
+@source "../../../node_modules/streamdown/dist/*.js";
+@source "../../../node_modules/@streamdown/math/dist/*.js";
+@source "../../../node_modules/@streamdown/code/dist/*.js";
+@source "../../shared/src/**/*.{ts,tsx}";
+
+@font-face {
+	font-family: 'Borna';
+	src: url('/fonts/Borna/Borna-Regular.otf') format('opentype');
+	font-weight: 400;
+	font-style: normal;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: 'Borna';
+	src: url('/fonts/Borna/Borna-RegularItalic.otf') format('opentype');
+	font-weight: 400;
+	font-style: italic;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: 'Borna';
+	src: url('/fonts/Borna/Borna-Medium.otf') format('opentype');
+	font-weight: 500;
+	font-style: normal;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: 'Borna';
+	src: url('/fonts/Borna/Borna-MediumItalic.otf') format('opentype');
+	font-weight: 500;
+	font-style: italic;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: 'Borna';
+	src: url('/fonts/Borna/Borna-SemiBold.otf') format('opentype');
+	font-weight: 600;
+	font-style: normal;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: 'Borna';
+	src: url('/fonts/Borna/Borna-SemiBoldItalic.otf') format('opentype');
+	font-weight: 600;
+	font-style: italic;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: 'Borna';
+	src: url('/fonts/Borna/Borna-Bold.otf') format('opentype');
+	font-weight: 700;
+	font-style: normal;
+	font-display: swap;
+}
+
+@font-face {
+	font-family: 'Borna';
+	src: url('/fonts/Borna/Borna-BoldItalic.otf') format('opentype');
+	font-weight: 700;
+	font-style: italic;
+	font-display: swap;
+}
+
+@custom-variant dark (&:is(.dark *));
+
+html,
+body {
+	@apply m-0 h-full overflow-hidden;
+}
+
+html.insight-embed {
+	color-scheme: light;
+	background-color: var(--panel);
+}
+
+html.insight-embed.dark {
+	color-scheme: dark;
+}
+
+html.insight-embed,
+html.insight-embed body {
+	overflow: hidden;
+}
+
+html.insight-embed body {
+	background-color: var(--panel);
+}
+
+html.insight-embed #app {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+	max-width: 100%;
+	overflow-x: auto;
+	overflow-y: hidden;
+	background-color: var(--panel);
+}
+
+html.insight-embed-app,
+html.insight-embed-app body,
+html.insight-embed-app #app {
+	background-color: var(--background);
+}
+
+* {
+	scrollbar-width: thin;
+	scrollbar-color: var(--border) transparent;
+}
+
+body {
+	font-family:
+		'Geist',
+		-apple-system,
+		BlinkMacSystemFont,
+		'Segoe UI',
+		'Roboto',
+		'Oxygen',
+		'Ubuntu',
+		'Cantarell',
+		'Fira Sans',
+		'Droid Sans',
+		'Helvetica Neue',
+		sans-serif;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+}
+
+code {
+	font-family: var(--font-mono);
+	font-size: 0.75rem;
+	background-color: var(--color-muted);
+	border-radius: var(--radius-sm);
+	padding: 0.125rem 0.25rem;
+}
+
+code.dollar:before {
+	content: '$ ';
+}
+
+@theme inline {
+	--radius-sm: calc(var(--radius) - 4px);
+	--radius-md: calc(var(--radius) - 2px);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) + 4px);
+	--radius-2xl: calc(var(--radius) + 8px);
+	--radius-3xl: calc(var(--radius) + 12px);
+	--radius-4xl: calc(var(--radius) + 16px);
+	--color-background: var(--background);
+	--color-panel: var(--panel);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-muted: var(--primary-muted);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+	--color-violet: var(--violet);
+	--color-chart-1: var(--chart-1);
+	--color-chart-2: var(--chart-2);
+	--color-chart-3: var(--chart-3);
+	--color-chart-4: var(--chart-4);
+	--color-chart-5: var(--chart-5);
+	--color-chart-6: var(--chart-6);
+	--color-chart-7: var(--chart-7);
+	--color-chart-8: var(--chart-8);
+	--color-chart-9: var(--chart-9);
+	--color-chart-10: var(--chart-10);
+	--color-chart-11: var(--chart-11);
+	--color-sidebar: var(--sidebar);
+	--color-sidebar-foreground: var(--sidebar-foreground);
+	--color-sidebar-primary: var(--sidebar-primary);
+	--color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+	--color-sidebar-accent: var(--sidebar-accent);
+	--color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+	--color-sidebar-border: var(--sidebar-border);
+	--color-sidebar-ring: var(--sidebar-ring);
+
+	--font-sans:
+		'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans',
+		'Droid Sans', 'Helvetica Neue', sans-serif;
+	--font-borna:
+		'Borna', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans',
+		'Droid Sans', 'Helvetica Neue', sans-serif;
+	--font-mono: 'Geist Mono', source-code-pro, Menlo, Monaco, Consolas, 'Courier New', monospace;
+}
+
+:root {
+	color-scheme: light;
+	--radius: 0.625rem;
+	--background: oklch(1 0 0);
+	--panel: oklch(0.98 0 0);
+	--foreground: oklch(0 0 0 / 0.85);
+	--card: oklch(1 0 0);
+	--card-foreground: oklch(0 0 0 / 0.85);
+	--popover: oklch(1 0 0);
+	--popover-foreground: oklch(0.129 0.042 264.695);
+	--primary: oklch(0.5077 0.281 277.89);
+	--primary-muted: oklch(0.721 0.157 290.2);
+	--primary-foreground: oklch(0.984 0.003 247.858);
+	--secondary: oklch(0.94 0 0);
+	--secondary-foreground: oklch(0.208 0.042 265.755);
+	--muted: oklch(0.94 0 0);
+	--muted-foreground: oklch(0 0 0 / 50%);
+	--accent: oklch(0.94 0 0);
+	--accent-foreground: oklch(0 0 0 / 0.85);
+	--destructive: oklch(0.577 0.245 27.325);
+	--border: oklch(0 0 0 / 0.1);
+	--input: oklch(0 0 0 / 0.1);
+	--ring: oklch(0 0 0 / 0.2);
+	--violet: oklch(0.5077 0.281 277.89);
+
+	--gradient-brand: linear-gradient(180deg, #522bff 0%, #6441ff 100%);
+	--gradient-brand-hover: linear-gradient(180deg, #6441ff 0%, #7858ff 100%);
+	--gradient-brand-border: linear-gradient(180deg, #522bff 0%, #3c1bcd 50.48%, #a591ff 100%);
+
+	--chart-1: oklch(0.398 0.07 227.392);
+	--chart-2: oklch(0.646 0.222 41.116);
+	--chart-3: oklch(0.6 0.118 184.704);
+	--chart-4: oklch(0.828 0.189 84.429);
+	--chart-5: oklch(0.769 0.188 70.08);
+	--chart-6: oklch(0.704 0.191 22.216);
+	--chart-7: oklch(0.58 0.22 295);
+	--chart-8: oklch(0.52 0.18 265);
+	--chart-9: oklch(0.62 0.18 145);
+	--chart-10: oklch(0.65 0.19 335);
+	--chart-11: oklch(0.68 0.15 210);
+
+	--sidebar: oklch(0.99 0 0);
+	--sidebar-foreground: oklch(0.129 0.042 264.695);
+	--sidebar-primary: oklch(0.208 0.042 265.755);
+	--sidebar-primary-foreground: oklch(0.984 0.003 247.858);
+	--sidebar-accent: oklch(0.94 0 0);
+	--sidebar-accent-foreground: oklch(0.208 0.042 265.755);
+	--sidebar-border: oklch(0 0 0 / 0.1);
+	--sidebar-ring: oklch(0 0 0 / 0.2);
+}
+
+.dark {
+	color-scheme: dark;
+	--background: oklch(0.145 0.005 270);
+	--panel: oklch(0.21 0.008 270);
+	--foreground: oklch(0.984 0.003 247.858);
+	--card: oklch(0.21 0.008 270);
+	--card-foreground: oklch(0.984 0.003 247.858);
+	--popover: oklch(0.21 0.008 270);
+	--popover-foreground: oklch(0.984 0.003 247.858);
+	--primary: oklch(0.721 0.157 290.2);
+	--primary-muted: oklch(0.721 0.157 290.2);
+	--primary-foreground: oklch(0.21 0.008 270);
+	--secondary: oklch(0.27 0.012 270);
+	--secondary-foreground: oklch(0.984 0.003 247.858);
+	--muted: oklch(0.27 0.012 270);
+	--muted-foreground: oklch(0.6 0.015 270);
+	--accent: oklch(0.27 0.012 270);
+	--accent-foreground: oklch(0.984 0.003 247.858);
+	--destructive: oklch(0.704 0.191 22.216);
+	--border: oklch(1 0 0 / 10%);
+	--input: oklch(1 0 0 / 15%);
+	--ring: oklch(0.42 0.012 270);
+	--sidebar: oklch(0.21 0.008 270);
+	--sidebar-foreground: oklch(0.984 0.003 247.858);
+	--sidebar-primary: oklch(0.488 0.243 264.376);
+	--sidebar-primary-foreground: oklch(0.984 0.003 247.858);
+	--sidebar-accent: oklch(0.27 0.012 270);
+	--sidebar-accent-foreground: oklch(0.984 0.003 247.858);
+	--sidebar-border: oklch(1 0 0 / 10%);
+	--sidebar-ring: oklch(0.42 0.012 270);
+
+	--chart-1: oklch(0.62 0.14 227.392);
+	--chart-2: oklch(0.72 0.2 41.116);
+	--chart-3: oklch(0.7 0.14 184.704);
+	--chart-4: oklch(0.88 0.18 84.429);
+	--chart-5: oklch(0.82 0.18 70.08);
+	--chart-6: oklch(0.76 0.19 22.216);
+	--chart-7: oklch(0.72 0.22 295);
+	--chart-8: oklch(0.68 0.18 265);
+	--chart-9: oklch(0.72 0.18 145);
+	--chart-10: oklch(0.74 0.18 335);
+	--chart-11: oklch(0.78 0.14 210);
+}
+
+@layer base {
+	* {
+		@apply border-border outline-ring/50;
+	}
+	body {
+		@apply bg-background text-foreground;
+	}
+}
+
+/* Streamdown styles */
+
+@utility markdown-small {
+	@apply **:[code]:text-[12px]! **:[pre]:text-[12px]! **:text-sm!;
+	--spacing: 1px;
+}
+
+/* Brand gradient (re-usable in buttons, switches, etc.) */
+
+@utility bg-brand-gradient {
+	background: var(--gradient-brand), var(--gradient-brand-border);
+}
+
+@utility bg-brand-gradient-hover {
+	background: var(--gradient-brand-hover), var(--gradient-brand-border);
+}
+
+@utility bg-brand-gradient-border {
+	background:
+		var(--gradient-brand) padding-box,
+		var(--gradient-brand-border) border-box;
+}
+
+@utility bg-brand-gradient-border-hover {
+	background:
+		var(--gradient-brand-hover) padding-box,
+		var(--gradient-brand-border) border-box;
+}
+
+[data-streamdown='heading-1'],
+[data-streamdown='heading-2'] {
+	font-size: 20px;
+}
+
+[data-streamdown='heading-3'],
+[data-streamdown='heading-4'],
+[data-streamdown='heading-5'],
+[data-streamdown='heading-6'] {
+	font-size: 18px;
+}
+
+[data-streamdown='table-header'],
+[data-streamdown='table-body'] {
+	background-color: var(--background);
+}
+
+/* Tables: single thin border instead of the nested double-border frame */
+[data-streamdown='table-wrapper'] {
+	gap: 0.25rem;
+	padding: 0.375rem;
+	background-color: var(--background);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-md);
+}
+
+[data-streamdown='table-wrapper'] > div:has(> [data-streamdown='table']) {
+	border: none;
+	border-radius: 0;
+}
+
+[data-streamdown='code-block'] {
+	position: relative;
+	gap: 0;
+	padding: 0;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-md);
+}
+
+[data-streamdown='code-block-header'] {
+	display: none;
+}
+
+[data-streamdown='code-block-body'] {
+	border: none;
+	border-radius: inherit;
+	padding: 0.625rem 0rem;
+}
+
+/* More breathing room between the line number gutter and the code */
+[data-streamdown='code-block-body'] code > span::before {
+	margin-right: 1.25rem;
+	padding-right: 0.5rem;
+}
+
+[data-streamdown='code-block'] > div:has(> [data-streamdown='code-block-actions']) {
+	position: absolute;
+	top: 0.25rem;
+	right: 0;
+	margin-top: 0;
+}
+
+[data-streamdown='code-block-actions'] {
+	gap: 0.25rem;
+	padding-right: 0.75rem;
+	background-color: var(--background);
+	border: none;
+}
+
+[data-streamdown='code-block-actions'] button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 1.5rem;
+	height: 1.5rem;
+	padding: 0;
+	border-radius: 9999px;
+	color: color-mix(in oklab, var(--muted-foreground) 70%, transparent);
+	transition: background-color 0.15s ease;
+}
+
+[data-streamdown='code-block-actions'] button svg {
+	width: 0.75rem;
+	height: 0.75rem;
+}
+
+[data-streamdown='code-block-actions'] button:hover {
+	background-color: color-mix(in oklab, var(--accent) 70%, transparent);
+	color: color-mix(in oklab, var(--muted-foreground) 70%, transparent);
+}
+
+.hide-code-header [data-streamdown='code-block'] {
+	border: none;
+	border-radius: 0;
+}
+
+.hide-code-header pre {
+	border: none;
+	border-radius: 0;
+}
+
+.hide-code-header [data-streamdown='code-block-body'] {
+	border: none;
+	padding: 0;
+}
+
+.file-viewer-search-match {
+	background-color: rgb(245 158 11 / 18%);
+	border-radius: 2px;
+}
+
+.dark .file-viewer-search-match {
+	background-color: rgb(250 204 21 / 20%);
+}
+
+::highlight(insight-file-preview-search-match) {
+	background-color: rgb(245 158 11 / 18%);
+}
+
+.dark ::highlight(insight-file-preview-search-match) {
+	background-color: rgb(250 204 21 / 20%);
+}
+
+/* Tiptap story editor */
+
+.story-editor .tiptap {
+	outline: none;
+	padding: 2rem 3rem 8rem 3rem;
+}
+
+.story-editor .tiptap > * + * {
+	margin-top: 0.75em;
+}
+
+.story-editor .tiptap h1 {
+	@apply text-xl font-bold;
+}
+
+.story-editor .tiptap h2 {
+	@apply text-lg font-semibold;
+}
+
+.story-editor .tiptap h3,
+.story-editor .tiptap h4,
+.story-editor .tiptap h5,
+.story-editor .tiptap h6 {
+	@apply text-base font-semibold;
+}
+
+.story-editor .tiptap p {
+	@apply text-sm leading-relaxed;
+}
+
+.story-editor .tiptap ul {
+	@apply list-disc pl-5 text-sm;
+}
+
+.story-editor .tiptap ol {
+	@apply list-decimal pl-5 text-sm;
+}
+
+.story-editor .tiptap li > p {
+	margin-top: 0;
+}
+
+.story-editor .tiptap blockquote {
+	@apply border-l-2 border-muted-foreground/30 pl-4 italic text-muted-foreground;
+}
+
+.story-editor .tiptap code {
+	@apply bg-muted px-1.5 py-0.5 rounded text-xs font-mono;
+}
+
+.story-editor .tiptap pre {
+	@apply bg-muted rounded-lg p-4 text-xs font-mono overflow-x-auto;
+}
+
+.story-editor .tiptap pre code {
+	@apply bg-transparent p-0 rounded-none;
+}
+
+.story-editor .tiptap hr {
+	@apply border-border my-4;
+}
+
+.story-editor .tiptap strong {
+	@apply font-semibold;
+}
+
+.story-editor .tiptap [data-type='chart-block'],
+.story-editor .tiptap [data-type='grid-block'] {
+	@apply my-3;
+}
+
+.story-editor .tiptap .insight-block-selected {
+	@apply bg-primary/10 rounded-md;
+}
+
+.dark .story-editor .tiptap .insight-block-selected {
+	@apply bg-blue-500/25;
+}
+
+.story-editor .drag-handle {
+	position: fixed;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	transform: translateX(-1rem);
+	cursor: grab;
+}
+
+.story-editor .drag-handle:active {
+	cursor: grabbing;
+}
+
+.story-editor .drag-handle > .drag-handle-button {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	flex: 0 0 1.5rem;
+	width: 1.5rem;
+	height: 1.5rem;
+	border-radius: 0.25rem;
+	@apply text-muted-foreground/40;
+	transition:
+		background-color 0.1s ease,
+		color 0.1s ease;
+}
+
+.story-editor .drag-handle:hover > .drag-handle-button {
+	@apply bg-muted text-muted-foreground;
+}
+
+.story-editor .drop-cursor {
+	@apply bg-primary-muted;
+	border-radius: 9999px;
+	transition: opacity 0.1s ease;
+}
+
+.story-editor.drop-indicator-active .drop-cursor {
+	display: none;
+}
+
+.insight-input .prompt-input {
+	max-height: 200px;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+}
+
+.insight-input-resizable .prompt-input {
+	min-height: var(--prompt-min-height);
+	max-height: none;
+	resize: vertical;
+}
+
+/* Mention pills: outlined chip, matching the "Share chat" button */
+.prompt-container .mention-pill,
+.message-container .mention-pill {
+	border: 1px solid var(--border);
+	background: var(--background);
+	font-size: 0.825rem;
+	font-weight: 470;
+	line-height: 1.2;
+	padding: 0.375rem 0.5rem;
+	box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+}
+
+.prompt-container .mention-pill-with-icon,
+.message-container .mention-pill-with-icon {
+	padding-left: 1.75rem;
+}
+
+.prompt-container .mention-pill .mention-pill-icon,
+.message-container .mention-pill .mention-pill-icon {
+	left: 0.5rem;
+	width: 0.75rem;
+	height: 0.75rem;
+}
+
+.dark .mention-pill {
+	border-color: var(--input);
+}
+
+/* Mention menu: match select dropdown styling */
+.prompt-container .mention-menu {
+	border-radius: var(--radius-lg);
+	padding: calc(var(--spacing) * 1);
+	box-shadow:
+		0 10px 15px -3px rgb(0 0 0 / 0.1),
+		0 4px 6px -4px rgb(0 0 0 / 0.1);
+}
+
+.mention-menu .mention-menu-item {
+	border-radius: var(--radius-md);
+	padding: calc(var(--spacing) * 1) calc(var(--spacing) * 2);
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr);
+	grid-template-areas:
+		'icon label'
+		'. label-right';
+	align-items: center;
+	column-gap: calc(var(--spacing) * 1.5);
+	row-gap: calc(var(--spacing) * 0.25);
+}
+
+.mention-menu .mention-menu-item-icon {
+	grid-area: icon;
+}
+
+.mention-menu .mention-menu-item-icon svg {
+	stroke-width: 1.2;
+	width: 14px;
+}
+
+.mention-menu .mention-menu-item-label {
+	grid-area: label;
+	min-width: 0;
+}
+
+.mention-menu .mention-menu-item-label-right {
+	grid-area: label-right;
+	margin-left: 0;
+	max-width: 100%;
+	white-space: nowrap;
+	direction: ltr;
+}
+
+.replay-nav-highlight:not([data-replay-bordered='true']) {
+	@apply rounded-xl;
+	outline: 2px solid var(--primary);
+	outline-offset: -2px;
+	animation: replay-highlight-pulse 2s ease-out forwards;
+}
+
+[data-replay-bordered='true'].replay-nav-highlight {
+	@apply rounded-xl;
+	outline: 2px solid var(--primary);
+	outline-offset: 2px;
+	animation: replay-highlight-pulse 2s ease-out forwards;
+}
+
+@keyframes replay-highlight-pulse {
+	0%,
+	70% {
+		outline-color: var(--primary);
+	}
+	100% {
+		outline-color: transparent;
+	}
+}
+
+.chats-replay-datepicker.react-datepicker,
+.chats-replay-datepicker .react-datepicker {
+	background-color: var(--popover);
+	color: var(--popover-foreground);
+	border-color: var(--border);
+	border-radius: var(--radius-md);
+}
+
+.chats-replay-datepicker .react-datepicker__header {
+	background-color: var(--muted);
+	border-color: var(--border);
+}
+
+.chats-replay-datepicker .react-datepicker__current-month,
+.chats-replay-datepicker .react-datepicker__day-name {
+	color: var(--secondary-foreground);
+}
+
+.chats-replay-datepicker .react-datepicker__day {
+	color: var(--secondary-foreground);
+}
+
+.chats-replay-datepicker .react-datepicker__navigation-icon::before {
+	border-color: var(--muted-foreground);
+}
+
+.chats-replay-datepicker.react-datepicker .react-datepicker__day--selected,
+.chats-replay-datepicker.react-datepicker .react-datepicker__day--in-selecting-range,
+.chats-replay-datepicker.react-datepicker .react-datepicker__day--in-range,
+.chats-replay-datepicker.react-datepicker .react-datepicker__day--range-start,
+.chats-replay-datepicker.react-datepicker .react-datepicker__day--range-end,
+.chats-replay-datepicker.react-datepicker .react-datepicker__month-text--selected,
+.chats-replay-datepicker.react-datepicker .react-datepicker__month-text--in-selecting-range,
+.chats-replay-datepicker.react-datepicker .react-datepicker__month-text--in-range,
+.chats-replay-datepicker.react-datepicker .react-datepicker__quarter-text--selected,
+.chats-replay-datepicker.react-datepicker .react-datepicker__quarter-text--in-selecting-range,
+.chats-replay-datepicker.react-datepicker .react-datepicker__quarter-text--in-range,
+.chats-replay-datepicker.react-datepicker .react-datepicker__year-text--selected,
+.chats-replay-datepicker.react-datepicker .react-datepicker__year-text--in-selecting-range,
+.chats-replay-datepicker.react-datepicker .react-datepicker__year-text--in-range {
+	background-color: var(--primary);
+	color: var(--primary-foreground);
+}
+
+.chats-replay-datepicker.react-datepicker .react-datepicker__day--keyboard-selected,
+.chats-replay-datepicker.react-datepicker .react-datepicker__month-text--keyboard-selected,
+.chats-replay-datepicker.react-datepicker .react-datepicker__quarter-text--keyboard-selected,
+.chats-replay-datepicker.react-datepicker .react-datepicker__year-text--keyboard-selected {
+	background-color: var(--primary);
+	color: var(--primary-foreground);
+}
+
+.chats-replay-datepicker.react-datepicker
+	.react-datepicker__day--in-selecting-range:not(.react-datepicker__day--in-range):not(
+		.react-datepicker__month-text--in-range
+	):not(.react-datepicker__quarter-text--in-range):not(.react-datepicker__year-text--in-range),
+.chats-replay-datepicker.react-datepicker
+	.react-datepicker__month-text--in-selecting-range:not(.react-datepicker__day--in-range):not(
+		.react-datepicker__month-text--in-range
+	):not(.react-datepicker__quarter-text--in-range):not(.react-datepicker__year-text--in-range),
+.chats-replay-datepicker.react-datepicker
+	.react-datepicker__quarter-text--in-selecting-range:not(.react-datepicker__day--in-range):not(
+		.react-datepicker__month-text--in-range
+	):not(.react-datepicker__quarter-text--in-range):not(.react-datepicker__year-text--in-range),
+.chats-replay-datepicker.react-datepicker
+	.react-datepicker__year-text--in-selecting-range:not(.react-datepicker__day--in-range):not(
+		.react-datepicker__month-text--in-range
+	):not(.react-datepicker__quarter-text--in-range):not(.react-datepicker__year-text--in-range) {
+	background-color: color-mix(in oklch, var(--primary) 15%, transparent);
+	color: var(--secondary-foreground);
+}
+
+.chats-replay-datepicker.react-datepicker .react-datepicker__day:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__month-text:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__quarter-text:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__year-text:not([aria-disabled='true']):hover {
+	background-color: color-mix(in oklch, var(--primary) 15%, transparent);
+	color: var(--foreground);
+}
+
+.chats-replay-datepicker.react-datepicker .react-datepicker__day--keyboard-selected:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker
+	.react-datepicker__month-text--keyboard-selected:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker
+	.react-datepicker__quarter-text--keyboard-selected:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker
+	.react-datepicker__year-text--keyboard-selected:not([aria-disabled='true']):hover {
+	background-color: var(--primary);
+	color: var(--primary-foreground);
+}
+
+.chats-replay-datepicker.react-datepicker .react-datepicker__day--selected:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__day--in-selecting-range:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__day--in-range:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__month-text--selected:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker
+	.react-datepicker__month-text--in-selecting-range:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__month-text--in-range:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__quarter-text--selected:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker
+	.react-datepicker__quarter-text--in-selecting-range:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__quarter-text--in-range:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__year-text--selected:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker
+	.react-datepicker__year-text--in-selecting-range:not([aria-disabled='true']):hover,
+.chats-replay-datepicker.react-datepicker .react-datepicker__year-text--in-range:not([aria-disabled='true']):hover {
+	background-color: var(--primary);
+	color: var(--primary-foreground);
+	opacity: 0.9;
+}
+
+/* Reduce the(⌘+scroll) overlay so that it doesn't get over the chat input. */
+.maplibregl-cooperative-gesture-screen {
+	background: rgb(0 0 0 / 0.25);
+	z-index: 2;
+}
+
+.maplibregl-cooperative-gesture-screen.maplibregl-show {
+	transition: opacity 0.05s;
+}
+
+/* Snap the hide-fade so the overlay clears quickly instead of lingering 2 s */
+.maplibregl-cooperative-gesture-screen:not(.maplibregl-show) {
+	transition: opacity 0.3s ease 0.2s;
+}
+
+/* MapLibre hover tooltip: strip default popup chrome so the inner box matches the chart tooltip */
+.maplibregl-popup.map-tooltip {
+	pointer-events: none;
+}
+
+.maplibregl-popup.map-tooltip .maplibregl-popup-content {
+	padding: 0;
+	background: transparent;
+	box-shadow: none;
+	border-radius: 0;
+}
+
+.maplibregl-popup.map-tooltip .maplibregl-popup-tip {
+	display: none;
+}
+
+/* Round the zoom buttons to match the control group so hover/active fills stay inside the corners */
+.maplibregl-ctrl-group button:first-child {
+	border-radius: 4px 4px 0 0;
+}
+
+.maplibregl-ctrl-group button:last-child {
+	border-radius: 0 0 4px 4px;
+}
+
+.maplibregl-ctrl-group button:only-child {
+	border-radius: inherit;
+}
+
+/*
+ * MapLibre controls (zoom +/- and attribution) follow the app theme by default (via the fallback variables).
+ * The interactive map view overrides them per-container through JS custom properties to match the selected map style.
+ */
+.dark {
+	--map-ctrl-icon-filter-default: invert(1);
+}
+
+.maplibregl-map .maplibregl-ctrl-group {
+	background: var(--map-ctrl-bg, var(--background));
+}
+
+.maplibregl-map .maplibregl-ctrl-group button + button {
+	border-top-color: var(--map-ctrl-border, var(--border));
+}
+
+.maplibregl-map .maplibregl-ctrl-group button:not(:disabled):hover,
+.maplibregl-map .maplibregl-ctrl-group button:not(:disabled):active {
+	background-color: var(--map-ctrl-hover, var(--accent));
+}
+
+.maplibregl-map .maplibregl-ctrl button .maplibregl-ctrl-icon,
+.maplibregl-map .maplibregl-ctrl-attrib.maplibregl-compact:after {
+	filter: var(--map-ctrl-icon-filter, var(--map-ctrl-icon-filter-default, none));
+}
+
+.maplibregl-map .maplibregl-ctrl.maplibregl-ctrl-attrib {
+	background-color: color-mix(in srgb, var(--map-ctrl-bg, var(--background)) 50%, transparent);
+}
+
+.maplibregl-map .maplibregl-ctrl-attrib.maplibregl-compact {
+	background-color: var(--map-ctrl-bg, var(--background));
+	color: var(--map-ctrl-fg, var(--foreground));
+}
+
+.maplibregl-map .maplibregl-ctrl-attrib.maplibregl-compact-show .maplibregl-ctrl-attrib-button {
+	background-color: var(--map-ctrl-hover, var(--accent));
+}
+
+.maplibregl-map .maplibregl-ctrl-attrib a {
+	color: var(--map-ctrl-fg, var(--foreground));
+}
+
+@keyframes chat-input-border-draw {
+	from {
+		stroke-dashoffset: 100;
+	}
+	to {
+		stroke-dashoffset: 0;
+	}
+}
+
+.chat-input-border-path {
+	stroke-dasharray: 100;
+	stroke-dashoffset: 100;
+	animation: chat-input-border-draw 1.2s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.chat-input-border-stop {
+	transition:
+		stop-color 0.3s ease,
+		stop-opacity 0.3s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.chat-input-border-path {
+		animation: none;
+		stroke-dasharray: none;
+		stroke-dashoffset: 0;
+	}
+}
+
+.sql-query-display code,
+.assistant-markdown [data-streamdown='code-block-body'] code {
+	background: transparent;
+	border-radius: 0;
+	padding: 0;
+}
+
+/*
+ * Custom story theme. Most slots land through the existing tokens that
+ * StoryThemeProvider overrides on its wrapper; these rules cover the slots
+ * with no token to ride on. Scoped to the wrapper, so nothing outside a
+ * themed custom story is affected.
+ */
+[data-story-themed='true'] {
+	font-family: var(--font-sans);
+	color: var(--foreground);
+}
+
+[data-story-themed='true'] :is(h1, h2, h3, h4) {
+	font-family: var(--font-heading);
+	letter-spacing: var(--story-heading-tracking, -0.02em);
+}
+
+[data-story-themed='true'] h1 {
+	font-size: calc(1.875rem * var(--story-heading-scale, 1));
+}
+
+[data-story-themed='true'] h2 {
+	font-size: calc(1.5rem * var(--story-heading-scale, 1));
+}
+
+[data-story-themed='true'] h3 {
+	font-size: calc(1.25rem * var(--story-heading-scale, 1));
+}
+
+[data-story-themed='true'] h4 {
+	font-size: calc(1.125rem * var(--story-heading-scale, 1));
+}
+
+[data-story-themed='true'] :is(p, li) {
+	color: var(--story-body-color, var(--foreground));
+	font-size: var(--story-body-size, 1rem);
+	line-height: var(--story-line-height, 1.6);
+}
+
+[data-story-themed='true'] :is(table, th, td) {
+	font-family: var(--font-sans);
+}
+
+[data-story-themed='true'] .recharts-cartesian-grid line[stroke='#ccc'] {
+	stroke: var(--chart-grid);
+}
+
+[data-story-themed='true'] .story-block {
+	background: var(--card);
+	border: var(--story-block-border-width, 0px) solid var(--border);
+	border-radius: var(--story-block-radius, var(--radius));
+	padding: 1rem;
+	overflow: hidden;
+}
+
+/* Tables ride on the background / panel / border tokens, re-pointed to the table slots inside the frame. */
+[data-story-themed='true'] .story-table {
+	--background: var(--story-table-bg);
+	--panel: var(--story-table-header-bg);
+	--border: var(--story-table-border);
+}
+
+[data-story-themed='true'] .story-table [data-slot='data-table-card'] {
+	border-width: var(--story-table-border-width, 1px);
+	border-radius: var(--story-block-radius, var(--radius));
+}
+
+[data-story-themed='true'] .story-table thead th {
+	color: var(--story-table-header-fg);
+}
+
+[data-story-table-striped='true'] .story-table tbody tr:nth-child(even) {
+	background: color-mix(in srgb, var(--story-table-header-bg) 50%, var(--story-table-bg));
+}

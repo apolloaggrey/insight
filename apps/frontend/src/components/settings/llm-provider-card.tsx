@@ -1,0 +1,137 @@
+import { Pencil, Trash2 } from 'lucide-react';
+import { getDefaultModelId, getProviderAuth } from '@insight/backend/provider-meta';
+import { providerKind, providerLabel, providerLabels, providerName } from '@insight/shared/types';
+import { LlmProviderIcon } from '../ui/llm-provider-icon';
+import type { LlmProvider } from '@insight/shared/types';
+import { Button } from '@/components/ui/button';
+
+interface ProviderCardProps {
+	provider: LlmProvider;
+	apiKeyPreview?: string | null;
+	credentialPreviews?: Record<string, string> | null;
+	baseUrl?: string | null;
+	envBaseUrl?: string;
+	enabledModels?: string[] | null;
+	/** Where this provider comes from, e.g. `ENV` or `insight_config.yaml`. */
+	badges?: string[];
+	isAdmin: boolean;
+	isFormActive: boolean;
+	onEdit: () => void;
+	onDelete?: () => void;
+	isDeleting?: boolean;
+	getModelDisplayName: (provider: LlmProvider, modelId: string) => string;
+}
+
+export function ProviderCard({
+	provider,
+	apiKeyPreview,
+	credentialPreviews,
+	baseUrl,
+	envBaseUrl,
+	enabledModels,
+	badges = [],
+	isAdmin,
+	isFormActive,
+	onEdit,
+	onDelete,
+	isDeleting,
+	getModelDisplayName,
+}: ProviderCardProps) {
+	return (
+		<div className='p-4 rounded-lg border border-border bg-muted/30'>
+			<div className='flex items-center gap-4'>
+				<div className='flex-1 grid gap-1'>
+					<div className='flex items-center gap-2'>
+						<LlmProviderIcon provider={provider} baseUrl={baseUrl || envBaseUrl} className='size-3.5' />
+						<span className='text-sm font-medium text-foreground'>{providerLabel(provider)}</span>
+						{providerName(provider) && (
+							<span className='text-xs text-muted-foreground'>
+								{providerLabels[providerKind(provider)]}
+							</span>
+						)}
+						{badges.map((badge) => (
+							<span
+								key={badge}
+								className='px-1.5 py-0.5 text-[10px] font-medium rounded bg-muted text-muted-foreground'
+							>
+								{badge}
+							</span>
+						))}
+					</div>
+					{apiKeyPreview || credentialPreviews ? (
+						<div className='flex items-center gap-2 text-xs text-muted-foreground flex-wrap'>
+							{apiKeyPreview && <span className='font-mono'>{apiKeyPreview}</span>}
+							{credentialPreviews &&
+								Object.entries(credentialPreviews).map(([key, preview]) => (
+									<span key={key} className='font-mono'>
+										{key}: {preview}
+									</span>
+								))}
+							{(baseUrl || envBaseUrl) && (
+								<>
+									<span className='text-border'>•</span>
+									<span className='truncate max-w-[200px]' title={baseUrl || envBaseUrl}>
+										{baseUrl || envBaseUrl}
+									</span>
+								</>
+							)}
+						</div>
+					) : (
+						<div className='flex items-center gap-2 text-xs text-muted-foreground'>
+							<span>
+								{getProviderAuth(provider).apiKey === 'required'
+									? 'API key from environment'
+									: getProviderAuth(provider).apiKey === 'optional'
+										? 'Using credentials from environment'
+										: 'No API key required'}
+							</span>
+							{envBaseUrl && (
+								<>
+									<span className='text-border'>•</span>
+									<span className='truncate max-w-[200px]' title={envBaseUrl}>
+										{envBaseUrl}
+									</span>
+								</>
+							)}
+						</div>
+					)}
+				</div>
+				{isAdmin && (
+					<div className='flex items-center gap-1'>
+						<Button variant='ghost' size='icon-sm' onClick={onEdit} disabled={isFormActive}>
+							<Pencil className='size-3 text-muted-foreground' />
+						</Button>
+						{onDelete && (
+							<Button
+								variant='ghost'
+								size='icon-sm'
+								onClick={onDelete}
+								disabled={isDeleting || isFormActive}
+							>
+								<Trash2 className='size-4 text-destructive' />
+							</Button>
+						)}
+					</div>
+				)}
+			</div>
+			<div className='mt-3 pt-3 border-t border-border/50'>
+				{enabledModels && enabledModels.length > 0 ? (
+					<>
+						<span className='text-xs text-muted-foreground'>Enabled models:</span>
+						<div className='flex flex-wrap gap-1.5 mt-1.5'>
+							{enabledModels.map((modelId) => (
+								<span key={modelId} className='px-2 py-0.5 text-xs rounded bg-primary/10 text-primary'>
+									{getModelDisplayName(provider, modelId)}
+								</span>
+							))}
+						</div>
+					</>
+				) : getDefaultModelId(provider) ? (
+					<span className='text-xs text-muted-foreground'>Default model: {getDefaultModelId(provider)}</span>
+				) : (
+					<span className='text-xs text-muted-foreground'>No model yet — add one to use this provider</span>
+				)}
+			</div>
+		</div>
+	);
+}

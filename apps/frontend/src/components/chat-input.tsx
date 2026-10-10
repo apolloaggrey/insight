@@ -1,0 +1,797 @@
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useId } from 'react';
+import { Link, useNavigate } from '@tanstack/react-router';
+import { useQuery } from '@tanstack/react-query';
+import { Plus, PencilRuler, Database, Paperclip, AlertTriangle, Shield, Check } from 'lucide-react';
+import { ATTACHMENT_ACCEPT } from '@insight/shared/attachments';
+import { Button, ChatButton, MicButton } from './ui/button';
+import { SlidingWaveform } from './chat-input-sliding-waveform';
+import { ChatPrompt, DATABASE_MENTION_TRIGGER, useStoryMentionOptions } from './chat-input-prompt';
+import { ChatInputModelSelect } from './chat-input-model-select';
+import { ChatInputMessageQueue } from './chat-input-message-queue';
+import { ChatInputAttachmentPreview } from './chat-input-attachment-preview';
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuSeparator,
+	DropdownMenuTrigger,
+} from './ui/dropdown-menu';
+import type { MentionOption, PromptHandle, SelectedMention } from 'prompt-mentions';
+import type { FormEvent } from 'react';
+import type { AgentHelpers } from '@/hooks/use-agent';
+import { ContextWindowRing } from '@/components/ui/chat-input-context-window-ring';
+import { SimpleTooltip } from '@/components/ui/tooltip';
+
+import { InputGroup, InputGroupAddon } from '@/components/ui/input-group';
+import { trpc } from '@/main';
+import { useAgentContext, useAgentMessagesSelector } from '@/contexts/agent.provider';
+import { useRegisterSetChatInputCallback } from '@/contexts/set-chat-input-callback';
+import { useTranscribe } from '@/hooks/use-transcribe';
+import { useAttachmentUpload } from '@/hooks/use-attachment-upload';
+import { parseBudgetError } from '@/lib/ai';
+import { cn } from '@/lib/utils';
+import { useChatId } from '@/hooks/use-chat-id';
+import { useModelSelection } from '@/hooks/use-model-selection';
+import { usePermissions } from '@/hooks/use-permissions';
+import { getShortcut } from '@/lib/keyboard-shortcuts';
+import { matchesShortcut } from '@/lib/platform';
+import { messageQueueStore } from '@/stores/chat-message-queue';
+import { chatInputRestoreStore, useChatInputRestore } from '@/stores/chat-input-restore';
+import { chatPendingCitationStore } from '@/stores/chat-pending-citation';
+import { useChatPendingCitation } from '@/hooks/use-chat-pending-citation';
+import { useEffectiveUserGroupFeatures } from '@/hooks/use-effective-user-group-features';
+import { SelectionCitationBanner } from '@/components/selection-citation-banner';
+import { ChatInputSuggestions } from '@/components/chat-input-suggestions';
+import { runWithStoryBeforeAgentSend, useStoryBeforeAgentSend } from '@/contexts/story-before-agent-send';
+
+const cycleModelShortcut = getShortcut('cycle-model').shortcut;
+
+type ChatInputBaseProps = {
+	promptRef: React.RefObject<PromptHandle | null>;
+	className?: string;
+	placeholder?: string;
+	initialText?: string;
+	onCancel?: () => void;
+	onSubmitMessage: AgentHelpers['queueOrSendMessage'];
+	allowQueueing?: boolean;
+};
+
+type ChatInputInlineProps = {
+	className?: string;
+	initialText: string;
+	onCancel?: () => void;
+	onSubmitMessage: AgentHelpers['queueOrSendMessage'];
+};
+
+export function ChatInput() {
+	const promptRef = useRef<PromptHandle>(null);
+	const { queueOrSendMessage } = useAgentContext();
+
+	useRegisterSetChatInputCallback((text) => {
+		promptRef.current?.clear();
+		if (text) {
+			promptRef.current?.insertText(text);
+		}
+		requestAnimationFrame(() => promptRef.current?.focus());
+	});
+
+	return <ChatInputBase promptRef={promptRef} onSubmitMessage={queueOrSendMessage} allowQueueing />;
+}
+
+export function ChatInputInline({ className, initialText, onCancel, onSubmitMessage }: ChatInputInlineProps) {
+	const promptRef = useRef<PromptHandle>(null);
+
+	return (
+		<ChatInputBase
+			promptRef={promptRef}
+			className={className}
+			initialText={initialText}
+			onCancel={onCancel}
+			onSubmitMessage={onSubmitMessage}
+		/>
+	);
+}
+
+function ChatInputBase({
+	promptRef,
+	className,
+	placeholder = 'Ask anything about your data...',
+	initialText,
+	onCancel,
+	onSubmitMessage,
+	allowQueueing,
+}: ChatInputBaseProps) {
+	const [inputText, setInputText] = useState('');
+	const {
+		isRunning,
+		cancelAgent,
+		isLoadingMessages,
+		adminMode,
+		setAdminMode,
+		setMentions,
+		submitQueuedMessageNow,
+		error,
+		selectedModel,
+	} = useAgentContext();
+	const navigate = useNavigate();
+	const { canChatWithInsightData } = usePermissions();
+	const { storyCreationEnabled } = useEffectiveUserGroupFeatures();
+	const storyMentionOptions = useStoryMentionOptions(storyCreationEnabled);
+	const chatId = useChatId();
+	const storyBeforeAgentSend = useStoryBeforeAgentSend();
+
+	const isAdminMode = canChatWithInsightData && adminMode;
+	const adminModeLocked = useAgentMessagesSelector((messages) => messages.some((message) => message.role === 'user'));
+	const handleSelectAdminMode = useCallback(() => {
+		if (!adminModeLocked) {
+			setAdminMode(!isAdminMode);
+			return;
+		}
+		if (isAdminMode) {
+			return;
+		}
+		navigate({ to: '/', search: { admin: true } });
+	}, [adminModeLocked, isAdminMode, setAdminMode, navigate]);
+	const { canCycleModels, cycleModel } = useModelSelection();
+	const uploadLimits = useQuery(trpc.storage.getUploadLimits.queryOptions());
+	const attachmentUpload = useAttachmentUpload({
+		documentsEnabled: uploadLimits.data?.enabled,
+		maxDocumentSizeMb: uploadLimits.data?.maxFileSizeMb ?? 0,
+	});
+	const chatInputRestore = useChatInputRestore(!!allowQueueing);
+	const effectivePlaceholder = isRunning && allowQueueing ? 'Add a follow-up...' : placeholder;
+
+	const agentSettings = useQuery(trpc.project.getAgentSettings.queryOptions());
+	const transcribeModels = useQuery(trpc.project.getKnownTranscribeModels.queryOptions());
+	const isTranscribeEnabled = agentSettings.data?.transcribe?.enabled ?? false;
+	const hasTranscribeProvider = Object.values(transcribeModels.data ?? {}).some((p) => p.hasKey);
+	const isTranscribeReady = isTranscribeEnabled && hasTranscribeProvider;
+
+	const budgetStatus = useQuery({
+		...trpc.budget.checkBudgetStatus.queryOptions({ provider: selectedModel?.provider ?? 'openai' }),
+		enabled: !!selectedModel?.provider,
+		refetchOnWindowFocus: false,
+	});
+	const isBudgetExceeded = !!parseBudgetError(error) || budgetStatus.data?.level === 'exceeded';
+
+	const [micWarning, setMicWarning] = useState(false);
+	const micWarningTimer = useRef(0);
+	const dropZoneRef = useRef<HTMLDivElement>(null);
+	const [isDragging, setIsDragging] = useState(false);
+
+	useEffect(() => promptRef.current?.focus(), [chatId, promptRef]);
+
+	useEffect(() => {
+		if (!allowQueueing || !chatInputRestore) {
+			return;
+		}
+
+		chatInputRestoreStore.clear();
+		promptRef.current?.clear();
+		promptRef.current?.insertText(chatInputRestore.text);
+		setInputText(chatInputRestore.text);
+		attachmentUpload.clearAttachments();
+		attachmentUpload.restoreDocuments(chatInputRestore.documents);
+
+		if (chatInputRestore.citation && chatId) {
+			chatPendingCitationStore.set({ ...chatInputRestore.citation, chatId });
+		}
+
+		const restoreImages = async () => {
+			const files = await Promise.all(
+				chatInputRestore.images.map(({ url, mediaType }, index) =>
+					dataUrlToFile(url, mediaType, `image-${index + 1}`),
+				),
+			);
+			await attachmentUpload.addFiles(files);
+			requestAnimationFrame(() => promptRef.current?.focus());
+		};
+		restoreImages();
+	}, [allowQueueing, chatInputRestore]); // eslint-disable-line react-hooks/exhaustive-deps
+
+	useEffect(() => {
+		const el = dropZoneRef.current;
+		if (!el) {
+			return;
+		}
+
+		let dragCounter = 0;
+
+		const handleDragEnter = (e: DragEvent) => {
+			e.preventDefault();
+			dragCounter++;
+			if (e.dataTransfer?.types.includes('Files')) {
+				setIsDragging(true);
+			}
+		};
+
+		const handleDragLeave = (e: DragEvent) => {
+			e.preventDefault();
+			dragCounter--;
+			if (dragCounter === 0) {
+				setIsDragging(false);
+			}
+		};
+
+		const handleDragOver = (e: DragEvent) => {
+			e.preventDefault();
+		};
+
+		const handleDrop = (e: DragEvent) => {
+			e.preventDefault();
+			dragCounter = 0;
+			setIsDragging(false);
+			if (e.dataTransfer?.files) {
+				attachmentUpload.addFiles(e.dataTransfer.files);
+			}
+		};
+
+		el.addEventListener('dragenter', handleDragEnter);
+		el.addEventListener('dragleave', handleDragLeave);
+		el.addEventListener('dragover', handleDragOver);
+		el.addEventListener('drop', handleDrop);
+		return () => {
+			el.removeEventListener('dragenter', handleDragEnter);
+			el.removeEventListener('dragleave', handleDragLeave);
+			el.removeEventListener('dragover', handleDragOver);
+			el.removeEventListener('drop', handleDrop);
+		};
+	}, [attachmentUpload.addFiles]); // eslint-disable-line
+
+	useEffect(() => {
+		const handler = (e: ClipboardEvent) => {
+			if (dropZoneRef.current?.contains(e.target as Node)) {
+				attachmentUpload.handlePaste(e);
+			}
+		};
+		document.addEventListener('paste', handler);
+		return () => document.removeEventListener('paste', handler);
+	}, [attachmentUpload.handlePaste]); // eslint-disable-line
+
+	const showMicWarning = useCallback(() => {
+		setMicWarning(true);
+		window.clearTimeout(micWarningTimer.current);
+		micWarningTimer.current = window.setTimeout(() => setMicWarning(false), 5000);
+	}, []);
+
+	const runGuardedAgentSend = useCallback(
+		(send: () => Promise<void>) =>
+			runWithStoryBeforeAgentSend({
+				beforeSend: () => (chatId ? storyBeforeAgentSend.run(chatId) : Promise.resolve({ canSend: true })),
+				send,
+			}),
+		[chatId, storyBeforeAgentSend],
+	);
+
+	const submitQueuedMessageWithGuard = useCallback(
+		async (messageId: string) => {
+			await runGuardedAgentSend(() => submitQueuedMessageNow(messageId));
+		},
+		[runGuardedAgentSend, submitQueuedMessageNow],
+	);
+
+	const submitMessage = useCallback(
+		async (text: string, currentMentions: SelectedMention[] = []) => {
+			const trimmedInput = text.trim();
+			const citationSnapshot = chatPendingCitationStore.getSnapshot();
+			const hasCitation = !!citationSnapshot && citationSnapshot.chatId === chatId;
+
+			if (!trimmedInput && !attachmentUpload.hasAttachments && !hasCitation) {
+				if (isRunning && allowQueueing) {
+					const queue = messageQueueStore.getSnapshot(chatId);
+					if (queue?.length) {
+						await submitQueuedMessageWithGuard(queue[0].id);
+					}
+				}
+				return;
+			}
+
+			if (
+				(isRunning && !allowQueueing) ||
+				isBudgetExceeded ||
+				attachmentUpload.isPreparing ||
+				attachmentUpload.hasErrors
+			) {
+				return;
+			}
+
+			await runGuardedAgentSend(() => {
+				const citation = hasCitation
+					? {
+							start: citationSnapshot.start,
+							end: citationSnapshot.end,
+							text: citationSnapshot.text,
+							storySlug: citationSnapshot.storySlug,
+							block: citationSnapshot.block,
+						}
+					: undefined;
+				if (hasCitation) {
+					chatPendingCitationStore.clear();
+				}
+
+				setMentions(currentMentions.map((m) => ({ id: m.id, label: m.label, trigger: m.trigger })));
+				promptRef.current?.clear();
+				setInputText('');
+
+				const { images, documents } = attachmentUpload.getPayload();
+				attachmentUpload.clearAttachments();
+
+				return onSubmitMessage({ text: trimmedInput, images, documents, citation });
+			});
+		},
+		[
+			onSubmitMessage,
+			isRunning,
+			allowQueueing,
+			isBudgetExceeded,
+			setMentions,
+			promptRef,
+			attachmentUpload,
+			chatId,
+			runGuardedAgentSend,
+			submitQueuedMessageWithGuard,
+		],
+	);
+
+	const {
+		state: transcribeState,
+		toggle: toggleRecording,
+		isRecording,
+		isTranscribing,
+		analyserRef,
+	} = useTranscribe({ onTranscribed: submitMessage });
+
+	useEffect(() => {
+		if (typeof initialText !== 'string') {
+			return;
+		}
+		promptRef.current?.clear();
+		promptRef.current?.insertText(initialText);
+		setInputText(initialText);
+		promptRef.current?.focus();
+	}, [initialText, promptRef]);
+
+	const handleSubmitMessage = async (e: FormEvent) => {
+		e.preventDefault();
+		const mentions = promptRef.current?.getMentions() ?? [];
+		await submitMessage(inputText, mentions);
+	};
+	const pendingCitation = useChatPendingCitation(chatId);
+	const isInputEmpty = !inputText.trim() && !attachmentUpload.hasAttachments && !pendingCitation;
+
+	const skills = useQuery(trpc.skill.list.queryOptions());
+	const databaseObjects = useQuery(trpc.project.getDatabaseObjects.queryOptions());
+	const hasSkills = Boolean(skills.data?.length);
+	const hasDatabases = Boolean(databaseObjects.data?.length);
+
+	const handleEditQueuedMessage = useCallback(
+		(text: string) => {
+			promptRef.current?.clear();
+			promptRef.current?.insertText(text);
+			promptRef.current?.focus();
+		},
+		[promptRef],
+	);
+
+	const openSkillsMenu = useCallback(() => {
+		promptRef.current?.insertText('/');
+	}, [promptRef]);
+
+	const openDatabaseMenu = useCallback(() => {
+		promptRef.current?.insertText(DATABASE_MENTION_TRIGGER);
+	}, [promptRef]);
+
+	const handleKeyDown = useCallback(
+		(event: React.KeyboardEvent) => {
+			const isTypingInPrompt = event.target instanceof HTMLElement && event.target.isContentEditable;
+			if (!isTypingInPrompt || !canCycleModels || !matchesShortcut(event.nativeEvent, cycleModelShortcut)) {
+				return;
+			}
+			event.preventDefault();
+			cycleModel();
+		},
+		[canCycleModels, cycleModel],
+	);
+
+	return (
+		<div ref={dropZoneRef} className={cn('px-3 pb-3 pt-0 md:px-3 md:pb-3 max-w-3xl w-full mx-auto', className)}>
+			<ChatInputMessageQueue onEditMessage={handleEditQueuedMessage} onSubmitNow={submitQueuedMessageWithGuard} />
+			<SelectionCitationBanner />
+			<BudgetBanner />
+			{allowQueueing && !isAdminMode && (
+				<ChatInputSuggestions
+					storyCreationEnabled={storyCreationEnabled}
+					isHidden={inputText.trim().length > 0}
+				/>
+			)}
+			{isAdminMode && <ChatInputAdminBadge />}
+
+			<form onSubmit={handleSubmitMessage} onKeyDown={handleKeyDown} className='mx-auto relative'>
+				<InputGroup
+					htmlFor='chat-input'
+					className={cn(
+						'bg-background dark:bg-background shadow-xs border-none max-md:rounded-4xl',
+						isDragging && 'ring-2 ring-primary/50 border-primary',
+						isAdminMode && 'ring-4 ring-amber-500/60',
+					)}
+				>
+					{!isAdminMode && <ChatInputAnimatedBorder />}
+					<ChatInputAttachmentPreview
+						attachments={attachmentUpload.attachments}
+						rejection={attachmentUpload.rejection}
+						onRemove={attachmentUpload.removeAttachment}
+					/>
+					<ChatPrompt
+						promptRef={promptRef}
+						placeholder={effectivePlaceholder}
+						storyCreationEnabled={storyCreationEnabled}
+						onChange={(value) => setInputText(value)}
+						onEnter={(value, mentions) => submitMessage(value, mentions)}
+					/>
+
+					<input
+						ref={attachmentUpload.fileInputRef}
+						type='file'
+						accept={ATTACHMENT_ACCEPT}
+						multiple
+						className='hidden'
+						onChange={attachmentUpload.handleFileInputChange}
+					/>
+
+					<InputGroupAddon align='block-end'>
+						{(!isTranscribeReady || (!isRecording && !isTranscribing)) && <ChatInputModelSelect />}
+
+						{isTranscribeReady && isRecording && <SlidingWaveform analyserRef={analyserRef} />}
+
+						<div className='flex items-center gap-1.5 md:gap-2 ml-auto relative'>
+							<ChatInputPlusMenu
+								hasDatabases={hasDatabases}
+								hasSkills={hasSkills}
+								canChatWithInsightData={canChatWithInsightData}
+								isAdminMode={isAdminMode}
+								adminModeLocked={adminModeLocked}
+								onSelectAdminMode={handleSelectAdminMode}
+								onAddAttachment={attachmentUpload.openFilePicker}
+								storyMentions={storyMentionOptions}
+								onAddStory={(mention) => {
+									promptRef.current?.appendMention({ id: mention.id, label: mention.label }, '#');
+								}}
+								onOpenSkills={openSkillsMenu}
+								onOpenDatabase={openDatabaseMenu}
+								onFocusPrompt={() => promptRef.current?.focus()}
+							/>
+
+							{onCancel && (
+								<Button variant='ghost' type='button' size='sm' onClick={onCancel}>
+									Cancel
+								</Button>
+							)}
+
+							<ContextWindowRing />
+
+							{isTranscribeReady && isRecording && <RecordingTimer />}
+							<MicButton
+								state={isTranscribeReady ? transcribeState : 'idle'}
+								onClick={isTranscribeReady ? toggleRecording : showMicWarning}
+								disabled={isRunning && !allowQueueing}
+							/>
+							{micWarning && <MicWarningBanner onDismiss={() => setMicWarning(false)} />}
+
+							{allowQueueing && isRunning ? (
+								<ChatButton
+									showStop={isInputEmpty}
+									disabled={!isInputEmpty && isBudgetExceeded}
+									onClick={isInputEmpty ? cancelAgent : handleSubmitMessage}
+									type='button'
+								/>
+							) : (
+								<ChatButton
+									showStop={isRunning}
+									disabled={isLoadingMessages || isInputEmpty || (!isRunning && isBudgetExceeded)}
+									onClick={isRunning ? cancelAgent : handleSubmitMessage}
+									type='button'
+								/>
+							)}
+						</div>
+					</InputGroupAddon>
+				</InputGroup>
+			</form>
+		</div>
+	);
+}
+
+async function dataUrlToFile(url: string, mediaType: string, name: string): Promise<File> {
+	const response = await fetch(url);
+	const blob = await response.blob();
+	return new File([blob], name, { type: mediaType });
+}
+
+const CHAT_INPUT_BORDER_STROKE = 1;
+
+function ChatInputAnimatedBorder() {
+	const containerRef = useRef<HTMLSpanElement>(null);
+	const gradientId = useId();
+	const [{ width, height, radius }, setGeometry] = useState({ width: 0, height: 0, radius: 0 });
+	const [isFocused, setIsFocused] = useState(false);
+
+	useLayoutEffect(() => {
+		const element = containerRef.current;
+		if (!element) {
+			return;
+		}
+		const updateGeometry = () => {
+			setGeometry({
+				width: element.clientWidth,
+				height: element.clientHeight,
+				radius: readBorderRadius(element.parentElement),
+			});
+		};
+		updateGeometry();
+		const observer = new ResizeObserver(updateGeometry);
+		observer.observe(element);
+		return () => observer.disconnect();
+	}, []);
+
+	useEffect(() => {
+		const parent = containerRef.current?.parentElement;
+		if (!parent) {
+			return;
+		}
+		const handleFocusIn = () => setIsFocused(true);
+		const handleFocusOut = (event: FocusEvent) => {
+			const nextTarget = event.relatedTarget as Node | null;
+			if (nextTarget && parent.contains(nextTarget)) {
+				return;
+			}
+			setIsFocused(false);
+		};
+		setIsFocused(parent.contains(document.activeElement));
+		parent.addEventListener('focusin', handleFocusIn);
+		parent.addEventListener('focusout', handleFocusOut);
+		return () => {
+			parent.removeEventListener('focusin', handleFocusIn);
+			parent.removeEventListener('focusout', handleFocusOut);
+		};
+	}, []);
+
+	const hasSize = width > 0 && height > 0;
+	const inset = CHAT_INPUT_BORDER_STROKE / 2;
+	const strokeRadius = Math.max(radius - inset, 0);
+	const strokeColor = isFocused ? 'var(--primary)' : 'var(--muted-foreground)';
+
+	return (
+		<span ref={containerRef} aria-hidden='true' className='pointer-events-none absolute inset-0 z-10'>
+			{hasSize && (
+				<svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} fill='none'>
+					<defs>
+						<linearGradient id={gradientId} x1='0%' y1='0%' x2='0%' y2='100%'>
+							<stop
+								className='chat-input-border-stop'
+								offset='0%'
+								style={{ stopColor: strokeColor, stopOpacity: isFocused ? 0.35 : 0.25 }}
+							/>
+							<stop
+								className='chat-input-border-stop'
+								offset='100%'
+								style={{ stopColor: strokeColor, stopOpacity: isFocused ? 1 : 0.4 }}
+							/>
+						</linearGradient>
+					</defs>
+					<rect
+						className='chat-input-border-path'
+						x={inset}
+						y={inset}
+						width={width - CHAT_INPUT_BORDER_STROKE}
+						height={height - CHAT_INPUT_BORDER_STROKE}
+						rx={strokeRadius}
+						ry={strokeRadius}
+						pathLength={100}
+						stroke={`url(#${gradientId})`}
+						strokeWidth={CHAT_INPUT_BORDER_STROKE}
+						strokeLinecap='round'
+					/>
+				</svg>
+			)}
+		</span>
+	);
+}
+
+function readBorderRadius(element: HTMLElement | null): number {
+	if (!element) {
+		return 0;
+	}
+	const radius = parseFloat(getComputedStyle(element).borderTopLeftRadius);
+	return Number.isFinite(radius) ? radius : 0;
+}
+
+function ChatInputAdminBadge() {
+	return (
+		<div className='flex justify-end pr-4'>
+			<SimpleTooltip
+				side='top'
+				align='end'
+				content='Chat with your internal Insight data to understand what users are doing.'
+			>
+				<span
+					className={cn(
+						'flex w-fit cursor-help items-center gap-1 mb-1',
+						'rounded-t-lg px-2 py-0.5',
+						'text-[10px] font-medium text-amber-700 dark:text-amber-300',
+						'bg-amber-500/60',
+					)}
+				>
+					<Shield className='size-3' />
+					Admin Mode
+				</span>
+			</SimpleTooltip>
+		</div>
+	);
+}
+
+function BudgetBanner() {
+	const { error, clearError, selectedModel } = useAgentContext();
+	const prevProviderRef = useRef(selectedModel?.provider);
+
+	useEffect(() => {
+		const prev = prevProviderRef.current;
+		prevProviderRef.current = selectedModel?.provider;
+		if (prev && prev !== selectedModel?.provider && parseBudgetError(error)) {
+			clearError();
+		}
+	}, [selectedModel?.provider, error, clearError]);
+
+	const budgetStatus = useQuery({
+		...trpc.budget.checkBudgetStatus.queryOptions({ provider: selectedModel?.provider ?? 'openai' }),
+		enabled: !!selectedModel?.provider,
+		refetchOnWindowFocus: false,
+	});
+
+	const errorMessage = parseBudgetError(error);
+	const level = errorMessage ? 'exceeded' : (budgetStatus.data?.level ?? 'ok');
+	const proactiveMessage = level !== 'ok' ? budgetStatus.data?.message : null;
+	const message = errorMessage ?? proactiveMessage;
+
+	if (!message) {
+		return null;
+	}
+
+	const isExceeded = level === 'exceeded';
+
+	return (
+		<div className='mb-2 flex items-start gap-2.5 rounded-2xl border border-input/50 bg-muted/50 px-3 py-2.5 text-sm text-muted-foreground animate-in fade-in slide-in-from-bottom-2 duration-200'>
+			<AlertTriangle className={cn('size-4 shrink-0 mt-0.5', isExceeded ? 'text-red-500' : 'text-amber-500')} />
+			<p className='flex-1 min-w-0'>{message}</p>
+		</div>
+	);
+}
+
+function ChatInputPlusMenu({
+	hasDatabases,
+	hasSkills,
+	storyMentions,
+	canChatWithInsightData,
+	isAdminMode,
+	adminModeLocked,
+	onSelectAdminMode,
+	onAddAttachment,
+	onAddStory,
+	onOpenSkills,
+	onOpenDatabase,
+	onFocusPrompt,
+}: {
+	hasDatabases: boolean;
+	hasSkills: boolean;
+	storyMentions: MentionOption[];
+	canChatWithInsightData: boolean;
+	isAdminMode: boolean;
+	adminModeLocked: boolean;
+	onSelectAdminMode: () => void;
+	onAddAttachment: () => void;
+	onAddStory: (mention: MentionOption) => void;
+	onOpenSkills: () => void;
+	onOpenDatabase: () => void;
+	onFocusPrompt: () => void;
+}) {
+	return (
+		<DropdownMenu>
+			<DropdownMenuTrigger asChild>
+				<button
+					type='button'
+					aria-label='Add context'
+					className='inline-flex items-center justify-center rounded-full size-7 text-foreground hover:text-foreground hover:bg-accent transition-colors cursor-pointer'
+				>
+					<Plus className='size-4 transition-transform duration-200 [[data-state=open]_&]:rotate-45' />
+				</button>
+			</DropdownMenuTrigger>
+			<DropdownMenuContent
+				side='top'
+				align='start'
+				collisionPadding={12}
+				className='min-w-44'
+				onCloseAutoFocus={(e) => {
+					e.preventDefault();
+					requestAnimationFrame(onFocusPrompt);
+				}}
+			>
+				<DropdownMenuItem onSelect={onAddAttachment}>
+					<Paperclip className='size-4' />
+					<span>Attach file</span>
+				</DropdownMenuItem>
+				{hasDatabases && (
+					<DropdownMenuItem onSelect={onOpenDatabase}>
+						<Database className='size-4' />
+						<span>Database tables</span>
+					</DropdownMenuItem>
+				)}
+				{storyMentions.map((mention) => (
+					<DropdownMenuItem key={mention.id} onSelect={() => onAddStory(mention)}>
+						{mention.icon}
+						<span>{mention.label}</span>
+					</DropdownMenuItem>
+				))}
+				{hasSkills && (
+					<DropdownMenuItem onSelect={onOpenSkills}>
+						<PencilRuler className='size-4' />
+						<span>Skills</span>
+					</DropdownMenuItem>
+				)}
+				{canChatWithInsightData && (
+					<>
+						<DropdownMenuSeparator />
+						<DropdownMenuItem
+							onSelect={onSelectAdminMode}
+							disabled={adminModeLocked && isAdminMode}
+							title={adminModeLocked && !isAdminMode ? 'Start a new chat in admin mode' : undefined}
+						>
+							<Shield className='size-4' />
+							<span>Admin mode</span>
+							{isAdminMode && <Check className='size-4 ml-auto' />}
+						</DropdownMenuItem>
+					</>
+				)}
+			</DropdownMenuContent>
+		</DropdownMenu>
+	);
+}
+
+function RecordingTimer() {
+	const [elapsed, setElapsed] = useState(0);
+
+	useEffect(() => {
+		const id = setInterval(() => setElapsed((s) => s + 1), 1000);
+		return () => clearInterval(id);
+	}, []);
+
+	const mins = Math.floor(elapsed / 60);
+	const secs = elapsed % 60;
+
+	return (
+		<span className='text-xs tabular-nums text-muted-foreground'>
+			{mins}:{secs.toString().padStart(2, '0')}
+		</span>
+	);
+}
+
+function MicWarningBanner({ onDismiss }: { onDismiss: () => void }) {
+	return (
+		<div className='absolute bottom-full right-0 mb-2 w-64 rounded-md border bg-popover p-3 text-popover-foreground shadow-md animate-in fade-in slide-in-from-bottom-2 duration-200'>
+			<button
+				type='button'
+				onClick={onDismiss}
+				className='absolute top-1 right-1.5 text-muted-foreground hover:text-foreground text-xs cursor-pointer'
+			>
+				&times;
+			</button>
+			<p className='text-sm'>
+				Voice input is not configured.{' '}
+				<Link
+					to='/settings/project/models'
+					className='font-medium text-primary underline underline-offset-2 hover:text-primary/80'
+				>
+					Go to Settings &rarr; Models
+				</Link>{' '}
+				to enable transcription and set up a provider. Ask your admin.
+			</p>
+		</div>
+	);
+}

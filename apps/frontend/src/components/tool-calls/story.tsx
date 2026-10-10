@@ -1,0 +1,191 @@
+import { useQuery } from '@tanstack/react-query';
+import { ArrowUpRight, Clock } from 'lucide-react';
+import { useEffect, useRef } from 'react';
+
+import { extractStorySummary } from '../../../../backend/src/utils/story-summary';
+import { StoryThumbnail } from '../story-thumbnail';
+import { CustomStoryThumbnail } from '../custom-story-thumbnail';
+import { Skeleton } from '../ui/skeleton';
+import { TextShimmer } from '../ui/text-shimmer';
+import { Button } from '../ui/button';
+import type { ToolCallComponentProps } from '.';
+import { trpc } from '@/main';
+import { StoryViewer } from '@/components/side-panel/story-viewer';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { useSidePanel } from '@/contexts/side-panel';
+import { useChatId } from '@/hooks/use-chat-id';
+import { useTimeAgo } from '@/hooks/use-time-ago';
+
+const STORY_ACTION_LABELS = {
+	create: { pending: 'Creating...', done: 'Created' },
+	update: { pending: 'Updating...', done: 'Updated' },
+	replace: { pending: 'Replacing...', done: 'Replaced' },
+	publish: { pending: 'Publishing...', done: 'Published' },
+	delete_files: { pending: 'Deleting files...', done: 'Deleted draft files' },
+	revert: { pending: 'Reverting draft...', done: 'Reverted draft' },
+} as const;
+
+export const StoryToolCall = ({ toolPart }: ToolCallComponentProps<'story'>) => {
+	const { open: openSidePanel, isVisible, currentStorySlug, chatId: sidePanelChatId } = useSidePanel();
+	const contextOrUrlChatId = useChatId();
+	const chatId = contextOrUrlChatId ?? sidePanelChatId;
+	const input = toolPart.input;
+	const isStreaming = toolPart.state === 'input-streaming';
+	const output = toolPart.output;
+	const summary = extractStorySummary(output?.code ?? '');
+	const hasAutoOpenedRef = useRef(false);
+
+	const finalStorySlug = output?.id ?? input?.id;
+	const canOpen = Boolean(chatId && finalStorySlug);
+	const isCreateAction = input?.action === 'create' && isClassicCreate(input);
+	const mountedBeforeOutputRef = useRef(toolPart.state !== 'output-available' && toolPart.state !== 'output-error');
+	const isCustomPublished =
+		mountedBeforeOutputRef.current && output?.format === 'custom' && output.success && input?.action === 'publish';
+
+	const isInInteractiveContext = Boolean(contextOrUrlChatId);
+
+	const { data: latestStory } = useQuery({
+		...trpc.story.getLatest.queryOptions({
+			chatId: chatId ?? '',
+			storySlug: finalStorySlug ?? '',
+		}),
+		enabled: !isStreaming && canOpen,
+	});
+
+	useEffect(() => {
+		const shouldAutoOpen = (isCreateAction && isStreaming) || isCustomPublished;
+		if (hasAutoOpenedRef.current || !shouldAutoOpen || !canOpen || !chatId || !finalStorySlug) {
+			return;
+		}
+
+		// Do not re-open if the same story is already visible.
+		if (isVisible && currentStorySlug === finalStorySlug) {
+			hasAutoOpenedRef.current = true;
+			return;
+		}
+
+		openSidePanel(
+			<StoryViewer
+				chatId={chatId}
+				storySlug={finalStorySlug}
+				isReadonlyMode={isInInteractiveContext ? false : undefined}
+			/>,
+			finalStorySlug,
+		);
+		hasAutoOpenedRef.current = true;
+	}, [
+		isCreateAction,
+		isCustomPublished,
+		isStreaming,
+		canOpen,
+		chatId,
+		finalStorySlug,
+		isVisible,
+		currentStorySlug,
+		openSidePanel,
+		isInInteractiveContext,
+	]);
+
+	if (!input) {
+		const partialAction = (toolPart as { input?: { action?: string } }).input?.action;
+		const loadingLabel =
+			partialAction === 'update' || partialAction === 'replace' ? 'Updating story' : 'Creating story';
+
+		return (
+			<div className='my-2 -mx-3 flex items-center gap-3 rounded-xl border p-4'>
+				<Skeleton className='size-8 rounded-lg' />
+				<Skeleton className='h-4 w-40' />
+				<TextShimmer text={loadingLabel} className='ml-auto text-xs' />
+			</div>
+		);
+	}
+
+	if (output?.error) {
+		return (
+			<div className='my-2 rounded-xl border border-red-500/20 bg-red-500/5 p-4 text-sm text-red-400'>
+				{output.error}
+			</div>
+		);
+	}
+
+	const isCustomStory = (latestStory?.format ?? output?.format ?? input.format) === 'custom';
+	const title = latestStory?.title ?? output?.title ?? input.title ?? input.id;
+	const labels = STORY_ACTION_LABELS[input.action ?? 'create'] ?? STORY_ACTION_LABELS.create;
+	const statusLabel = isStreaming
+		? labels.pending
+		: `${labels.done}${output?.version ? ` · v${output.version}` : ''}`;
+
+	const handleOpen = () => {
+		if (!canOpen || !chatId || !finalStorySlug) {
+			return;
+		}
+		openSidePanel(
+			<StoryViewer
+				chatId={chatId}
+				storySlug={finalStorySlug}
+				isReadonlyMode={isInInteractiveContext ? false : undefined}
+			/>,
+			finalStorySlug,
+		);
+	};
+
+	return (
+		<button
+			type='button'
+			onClick={handleOpen}
+			disabled={!canOpen}
+			className='group my-2 -mx-3 flex items-center gap-3 pr-3 rounded-lg border bg-background text-left transition-colors hover:bg-accent/50 disabled:opacity-50 disabled:cursor-default cursor-pointer overflow-hidden'
+		>
+			<div className='items-end relative h-16 w-30 shrink-0'>
+				{isCustomStory ? (
+					<CustomStoryThumbnail isToolPart={true} />
+				) : (
+					<StoryThumbnail
+						summary={summary}
+						className='rounded-lg overflow-visible right-6'
+						isToolPart={true}
+					/>
+				)}
+			</div>
+
+			<div className='flex flex-col gap-1 min-w-0 flex-1 pl-5 py-3'>
+				<span className='text-sm font-medium truncate'>{title}</span>
+				<div className='flex items-center gap-2'>
+					<span className='text-xs text-muted-foreground'>{statusLabel}</span>
+					{latestStory?.isLive && latestStory?.cachedAt && (
+						<LiveStoryTimestamp cachedAt={latestStory.cachedAt} />
+					)}
+				</div>
+			</div>
+
+			{canOpen && (
+				<Button variant='ghost-muted' size='icon-xs' className='hover:bg-transparent' asChild>
+					<span>
+						<ArrowUpRight className='size-3.5' />
+					</span>
+				</Button>
+			)}
+		</button>
+	);
+};
+
+function LiveStoryTimestamp({ cachedAt }: { cachedAt: string | Date }) {
+	const timestampMs = new Date(cachedAt).getTime();
+	const timeAgo = useTimeAgo(timestampMs);
+
+	return (
+		<Tooltip>
+			<TooltipTrigger asChild>
+				<div className='flex items-center gap-1 rounded-full bg-secondary/50 px-1.5 py-0.5 text-[10px] text-muted-foreground'>
+					<Clock className='size-3' />
+					<span>Updated {timeAgo.humanReadable.toLowerCase()}</span>
+				</div>
+			</TooltipTrigger>
+			<TooltipContent>Updated {new Date(cachedAt).toLocaleString()}</TooltipContent>
+		</Tooltip>
+	);
+}
+
+function isClassicCreate(input: { format?: 'classic' | 'custom'; code?: string }): boolean {
+	return input.format === 'classic' || (input.format === undefined && input.code !== undefined);
+}

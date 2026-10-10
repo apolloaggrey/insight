@@ -1,0 +1,32 @@
+import { Database as Sqlite } from 'bun:sqlite';
+import { BunSQLiteDatabase, drizzle as drizzleBunSqlite } from 'drizzle-orm/bun-sqlite';
+import { drizzle as drizzlePostgres } from 'drizzle-orm/postgres-js';
+import { EnhancedQueryLogger } from 'drizzle-query-logger';
+import postgres from 'postgres';
+
+import { env } from '../env';
+import dbConfig, { Dialect } from './dbConfig';
+import * as pgSchema from './pg-schema';
+import * as sqliteSchema from './sqlite-schema';
+
+const logger = env.DB_QUERY_LOGGING ? new EnhancedQueryLogger() : undefined;
+
+function createDb() {
+	if (dbConfig.dialect === Dialect.Postgres) {
+		const ssl = env.DB_SSL ? 'require' : undefined;
+		const sql = postgres(dbConfig.dbUrl, { ssl });
+		return drizzlePostgres(sql, { schema: pgSchema, logger });
+	} else {
+		const sqlite = new Sqlite(dbConfig.dbUrl);
+		sqlite.run('PRAGMA foreign_keys = ON;');
+		return drizzleBunSqlite(sqlite, { schema: sqliteSchema, logger });
+	}
+}
+
+export const db = createDb() as BunSQLiteDatabase<typeof sqliteSchema> & {
+	$client: Sqlite;
+};
+
+export type DBTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+export type DBExecutor = typeof db | DBTransaction;

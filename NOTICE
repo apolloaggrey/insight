@@ -1,0 +1,80 @@
+Insight
+=======
+
+Insight is a modified version of nao (https://github.com/getnao/nao), forked at commit
+5bde830e12d2d4b70584244202d42ba9b6113f5b (9 October 2026).
+
+nao is Copyright (c) nao Labs, Inc. and contributors, licensed under the Apache License 2.0
+(see LICENSE). "nao" is a trademark of nao Labs; Insight is not affiliated with or endorsed by
+nao Labs, and does not use the nao name or logo.
+
+What was left out
+-----------------
+nao's files marked "/* @license Enterprise */" are under the nao Labs Commercial License, not
+Apache 2.0. None of them is included. The commercial terms in LICENSE therefore do not apply to
+any file in this repository.
+
+What was written independently
+------------------------------
+The files below replace the Enterprise files. They were written from scratch against the
+interfaces the Apache-licensed code calls and the behaviour its Apache-licensed tests describe,
+without using the Enterprise source. They are licensed under the Apache License 2.0 and start
+with the comment "Insight: independent implementation".
+
+  apps/backend/src/queries/branding.queries.ts
+  apps/backend/src/queries/member-budget.queries.ts
+  apps/backend/src/routes/branding.ts
+  apps/backend/src/routes/sso.ts
+  apps/backend/src/services/branding.service.ts
+  apps/backend/src/services/excluded-columns.service.ts
+  apps/backend/src/services/license-endpoints.ts
+  apps/backend/src/services/license-startup.ts
+  apps/backend/src/services/license.service.ts
+  apps/backend/src/services/member-budget.service.ts
+  apps/backend/src/services/microsoft-auth.service.ts
+  apps/backend/src/services/microsoft-user-group-membership.service.ts
+  apps/backend/src/services/oidc-auth.service.ts
+  apps/backend/src/services/sso-group-mapping.service.ts
+  apps/backend/src/services/sso-login-sync.service.ts
+  apps/backend/src/services/sso-session.service.ts
+  apps/backend/src/services/sso-token.service.ts
+  apps/backend/src/services/sso-user-group-mapping.service.ts
+  apps/backend/src/services/sso-user-group-membership.service.ts
+  apps/backend/src/trpc/branding.routes.ts
+  apps/backend/src/trpc/license.routes.ts
+  apps/backend/src/trpc/member-budget.routes.ts
+  apps/backend/src/types/license.ts
+  apps/backend/src/types/member-budget.ts
+  apps/backend/src/utils/member-budget.ts
+  apps/backend/src/utils/sso-group-mapping.ts
+  apps/backend/src/utils/sso-session.ts
+  apps/frontend/src/components/auth-microsoft-button.tsx
+  apps/frontend/src/components/auth-oidc-button.tsx
+  apps/frontend/src/components/brand-color.tsx
+  apps/frontend/src/components/branding-head.tsx
+  apps/frontend/src/components/settings/member-budget-kit.tsx
+  apps/frontend/src/components/settings/member-budget-settings.tsx
+  apps/frontend/src/components/settings/my-member-budget.tsx
+  apps/frontend/src/components/settings/sso-token-inspector.tsx
+  apps/frontend/src/components/settings/user-group-budget.tsx
+  apps/frontend/src/components/settings/user-group-user-budget.tsx
+  apps/frontend/src/components/settings/white-label-settings.tsx
+  apps/frontend/src/hooks/use-branding.ts
+  apps/frontend/src/routes/_sidebar-layout.settings.enterprise.tsx
+
+What was changed in nao's Apache-licensed files
+-----------------------------------------------
+- Product name and logos: "nao" replaced by "Insight" in user-visible text, and the logo,
+  favicon and icon artwork replaced (file names kept so imports still resolve).
+- No licence key: every feature is on; INSIGHT_DISABLED_FEATURES switches features off.
+- No contact with nao Labs: the licence-server ping, the PyPI update check and the default
+  telemetry key are disabled.
+- apps/backend/src/app.ts: nao Cloud's internal backoffice API is not registered.
+- apps/backend/src/queries/account.queries.ts: refresh-token queries for Microsoft sign-in.
+- apps/frontend: "Upgrade to Enterprise" badges read "Off"; the Enterprise page is "Features".
+- cli: package renamed insight-core with an `insight` command, version 1.0.0.
+- Tests: expectations updated for the product name; nao's licence-key test replaced.
+- Database connections managed from the web app: Oracle and SQLite engines, insight_connections.yaml
+  merged by the config loader, test/sync/context-path endpoints in the query service, a
+  database_connection table, and the Settings > Project > Databases page.
+- Dependencies installed against cli/uv.lock (sqlglot pinned below 30.1).

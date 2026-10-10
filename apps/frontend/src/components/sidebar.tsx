@@ -1,0 +1,648 @@
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Link, useMatchRoute, useNavigate, useRouterState } from '@tanstack/react-router';
+import {
+	ArrowLeftFromLine,
+	ArrowRightToLine,
+	ChevronRight,
+	NewspaperIcon,
+	PlusIcon,
+	SearchIcon,
+	X,
+} from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { ProjectSwitcher } from './project-selector';
+import { ChatFilterMenu } from './sidebar-chat-filter-menu';
+import { ChatListItem } from './sidebar-chat-list-item';
+import { SidebarSettingsNav } from './sidebar-settings-nav';
+import { SidebarUserMenu } from './sidebar-user-menu';
+import { Spinner } from './ui/spinner';
+import StoryIcon from './ui/story-icon';
+import type { ChatFilterType, ChatGroup, ChatGroupBy, GroupedChatItem } from '@insight/shared/types';
+import type { LucideIcon } from 'lucide-react';
+
+import InsightLogo from '@/components/icons/insight-logo.svg';
+import { Button } from '@/components/ui/button';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { useCommandMenuCallback } from '@/contexts/command-menu-callback';
+import { useSidebar } from '@/contexts/sidebar';
+import { brandingAssetUrl, useBranding } from '@/hooks/use-branding';
+import { useChatViewPreferences } from '@/hooks/use-chat-view-preferences';
+import { useIsCloud } from '@/hooks/use-insight-mode';
+import { useProjectSwitch } from '@/hooks/use-project-switch';
+import { useSidebarSectionOpen } from '@/hooks/use-sidebar-section-open';
+import { useTimeAgo } from '@/hooks/use-time-ago';
+import { getActiveProjectId, setActiveProjectId } from '@/lib/active-project';
+import { getShortcutLabel } from '@/lib/keyboard-shortcuts';
+import { invalidateStoriesCaches } from '@/lib/stories-cache';
+import { cn, hideIf } from '@/lib/utils';
+import { trpc } from '@/main';
+import { usePermissions } from '@/hooks/use-permissions';
+import { useUnreadAutomationRunCount, useUnreadCount } from '@/queries/use-notifications';
+
+export function Sidebar() {
+	const navigate = useNavigate();
+	const queryClient = useQueryClient();
+	const matchRoute = useMatchRoute();
+	const { isCollapsed, isMobile, isMobileOpen, closeMobile, toggle: toggleSidebar } = useSidebar();
+	const [toggleHintOpen, setToggleHintOpen] = useState(false);
+	const { fire: openCommandMenu } = useCommandMenuCallback();
+	const project = useQuery(trpc.project.getCurrent.queryOptions());
+	const projects = useQuery(trpc.project.listForCurrentUser.queryOptions());
+	const switchProject = useProjectSwitch(project.data?.id);
+	const config = useQuery(trpc.system.getPublicConfig.queryOptions());
+	const branding = useBranding();
+	const customColor = branding.enabled ? branding.brandColor : null;
+	const { isAdmin, isContextAdmin, isOrgAdmin, isViewer } = usePermissions();
+	const isCloud = useIsCloud();
+	const betaAutomationsEnabled = config.data?.betaAutomationsEnabled === true;
+	const showAutomations = !isViewer && betaAutomationsEnabled;
+	const unreadCount = useUnreadCount(project.data?.id).data ?? 0;
+	const unreadAutomationRunCount = useUnreadAutomationRunCount(showAutomations, project.data?.id).data ?? 0;
+	const hasFeedActivity = unreadCount > 0 || unreadAutomationRunCount > 0;
+	const { groupBy, filters, setGroupBy, toggleFilter } = useChatViewPreferences();
+
+	const locationPath = useRouterState({ select: (s) => s.location.pathname });
+	const isSettingsRoute = matchRoute({ to: '/settings', fuzzy: true });
+	const isInSettings = !!isSettingsRoute && !isViewer;
+	const effectiveIsCollapsed = isMobile ? false : isCollapsed;
+
+	useEffect(() => {
+		setToggleHintOpen(false);
+	}, [effectiveIsCollapsed]);
+
+	useEffect(() => {
+		if (isMobile && isMobileOpen) {
+			closeMobile();
+		}
+	}, [locationPath]); // eslint-disable-line react-hooks/exhaustive-deps
+
+	const handleNavigateHome = useCallback(() => {
+		navigate({ to: '/' });
+		if (isMobile) {
+			closeMobile();
+		}
+	}, [navigate, isMobile, closeMobile]);
+
+	const handleNavigateStories = useCallback(() => {
+		invalidateStoriesCaches(queryClient);
+		navigate({ to: '/stories', search: { folderId: null } });
+		if (isMobile) {
+			closeMobile();
+		}
+	}, [navigate, isMobile, closeMobile, queryClient]);
+
+	const handleNavigateFeed = useCallback(() => {
+		navigate({ to: '/feed' });
+		if (isMobile) {
+			closeMobile();
+		}
+	}, [navigate, isMobile, closeMobile]);
+
+	const handleSearchChats = useCallback(() => {
+		openCommandMenu();
+		if (isMobile) {
+			closeMobile();
+		}
+	}, [openCommandMenu, isMobile, closeMobile]);
+
+	useEffect(() => {
+		if (!project.data?.id) {
+			return;
+		}
+
+		if (getActiveProjectId() !== project.data.id) {
+			setActiveProjectId(project.data.id);
+		}
+	}, [project.data?.id]);
+
+	const handleProjectChange = useCallback(
+		async (projectId: string) => {
+			const didSwitch = await switchProject(projectId);
+			if (didSwitch && isMobile) {
+				closeMobile();
+			}
+		},
+		[closeMobile, isMobile, switchProject],
+	);
+
+	const sidebarContent = (
+		<div
+			className={cn(
+				'flex flex-col h-full overflow-hidden bg-sidebar dark:bg-background',
+				isMobile
+					? 'w-72'
+					: cn(
+							'border-r border-sidebar-border transition-[width,background-color] duration-300',
+							effectiveIsCollapsed ? 'w-13' : 'w-72',
+						),
+			)}
+		>
+			<div className='p-2 flex flex-col'>
+				<div className='flex items-center relative'>
+					<button
+						type='button'
+						onClick={handleNavigateHome}
+						aria-label={isViewer ? 'View shared items' : 'New chat'}
+						className={cn(
+							'flex items-center justify-center mr-auto absolute left-0 z-0 rounded-md cursor-pointer hover:bg-sidebar-accent transition-[opacity,visibility,background-color] duration-300',
+							branding.enabled && branding.hasLogo ? 'p-1' : 'p-2',
+							hideIf(effectiveIsCollapsed),
+						)}
+					>
+						{branding.enabled && branding.hasLogo ? (
+							<img
+								src={brandingAssetUrl('logo', branding.updatedAt)}
+								alt={branding.appName ?? 'Logo'}
+								className='h-7 w-auto max-w-[9rem] object-contain'
+							/>
+						) : (
+							<InsightLogo
+								className={cn('size-5', customColor && '[&_stop]:[stop-color:var(--brand-logo)]')}
+								style={
+									customColor ? ({ '--brand-logo': customColor } as React.CSSProperties) : undefined
+								}
+							/>
+						)}
+					</button>
+
+					<div className={cn('ml-auto z-10 flex items-center gap-1', effectiveIsCollapsed && 'flex-col')}>
+						{isMobile ? (
+							<Button
+								variant='ghost'
+								size='icon-md'
+								onClick={closeMobile}
+								className='text-muted-foreground'
+							>
+								<X className='size-4' />
+							</Button>
+						) : (
+							<Tooltip open={toggleHintOpen} onOpenChange={setToggleHintOpen}>
+								<TooltipTrigger asChild>
+									<Button
+										variant='ghost'
+										size='icon-md'
+										onClick={() => toggleSidebar()}
+										className='text-muted-foreground'
+										aria-label='Toggle sidebar'
+									>
+										{effectiveIsCollapsed ? (
+											<ArrowRightToLine className='size-4' />
+										) : (
+											<ArrowLeftFromLine className='size-4' />
+										)}
+									</Button>
+								</TooltipTrigger>
+								<TooltipContent side='right'>
+									<span className='flex items-center gap-2'>
+										Toggle sidebar
+										<kbd className='text-[10px] opacity-60 font-sans'>
+											{getShortcutLabel('toggle-sidebar')}
+										</kbd>
+									</span>
+								</TooltipContent>
+							</Tooltip>
+						)}
+					</div>
+				</div>
+				{isInSettings && (
+					<ProjectSwitcher
+						projects={projects.data ?? []}
+						currentProjectId={project.data?.id}
+						onChange={handleProjectChange}
+						variant='sidebar'
+						className={cn(
+							'overflow-hidden transition-[height,margin,opacity,visibility] duration-300',
+							effectiveIsCollapsed ? 'h-0 mt-0' : 'h-[30px] mt-2',
+							hideIf(effectiveIsCollapsed),
+						)}
+					/>
+				)}
+				{!isInSettings && (
+					<>
+						<div className='py-4'>
+							{!isViewer && (
+								<SidebarMenuButton
+									icon={PlusIcon}
+									label='New chat'
+									shortcut={getShortcutLabel('new-chat')}
+									isCollapsed={effectiveIsCollapsed}
+									onClick={handleNavigateHome}
+								/>
+							)}
+							<SidebarMenuButton
+								icon={SearchIcon}
+								label='Search chats'
+								shortcut={getShortcutLabel('command-menu')}
+								isCollapsed={effectiveIsCollapsed}
+								onClick={handleSearchChats}
+							/>
+							<SidebarMenuButton
+								icon={StoryIcon as unknown as LucideIcon}
+								label='Stories'
+								shortcut={getShortcutLabel('go-to-stories')}
+								isCollapsed={effectiveIsCollapsed}
+								onClick={handleNavigateStories}
+							/>
+							<SidebarMenuButton
+								icon={NewspaperIcon as unknown as LucideIcon}
+								label='Feed'
+								shortcut=''
+								isCollapsed={effectiveIsCollapsed}
+								onClick={handleNavigateFeed}
+								indicator={hasFeedActivity}
+							/>
+						</div>
+					</>
+				)}
+			</div>
+
+			{isInSettings ? (
+				<SidebarSettingsNav
+					isCollapsed={effectiveIsCollapsed}
+					isAdmin={isAdmin}
+					isContextAdmin={isContextAdmin}
+					isViewer={isViewer}
+					isCloud={isCloud}
+					isCloudBillingEnabled={config.data?.cloudBillingEnabled === true}
+					isOrgAdmin={isOrgAdmin}
+				/>
+			) : (
+				<>
+					<SidebarAutomationsNav isCollapsed={effectiveIsCollapsed} enabled={showAutomations} />
+					<SidebarChatHeader
+						isCollapsed={effectiveIsCollapsed}
+						groupBy={groupBy}
+						filters={filters}
+						onGroupByChange={setGroupBy}
+						onFilterToggle={toggleFilter}
+					/>
+					<SidebarNav
+						isCollapsed={effectiveIsCollapsed}
+						groupBy={groupBy}
+						filters={filters}
+						isViewer={isViewer}
+					/>
+				</>
+			)}
+
+			{!isInSettings && <div className='border-b border-sidebar-border mx-2'></div>}
+
+			<div className={cn('mt-auto transition-[padding] duration-300', effectiveIsCollapsed ? 'p-1' : 'p-2')}>
+				<SidebarUserMenu isCollapsed={effectiveIsCollapsed} isInSettings={!!isInSettings} />
+			</div>
+		</div>
+	);
+
+	if (isMobile) {
+		return (
+			<>
+				{isMobileOpen && (
+					<div className='fixed inset-0 z-40 flex'>
+						<div
+							className='fixed inset-0 bg-black/50 animate-in fade-in duration-200'
+							onClick={closeMobile}
+						/>
+						<div className='relative z-50 animate-in slide-in-from-left duration-200'>{sidebarContent}</div>
+					</div>
+				)}
+			</>
+		);
+	}
+
+	return sidebarContent;
+}
+
+function SidebarMenuButton({
+	icon: Icon,
+	label,
+	shortcut,
+	isCollapsed,
+	onClick,
+	indicator = false,
+}: {
+	icon: LucideIcon;
+	label: string;
+	shortcut: string;
+	isCollapsed: boolean;
+	onClick: () => void;
+	indicator?: boolean;
+}) {
+	return (
+		<Button
+			variant='ghost'
+			className={cn(
+				'w-full justify-start relative group shadow-none transition-[padding,height,background-color] duration-300 p-[10px_!important] gap-4',
+				isCollapsed ? 'h-9' : '',
+			)}
+			onClick={onClick}
+		>
+			<span className='relative flex items-center'>
+				<Icon className='size-4' />
+				{indicator && (
+					<span
+						aria-hidden
+						className='absolute -right-1 -top-1 size-2 rounded-full bg-primary ring-2 ring-sidebar'
+					/>
+				)}
+			</span>
+			<div className={cn('flex items-center transition-[opacity,visibility] duration-300', hideIf(isCollapsed))}>
+				<span>{label}</span>
+				<kbd className='group-hover:opacity-100 opacity-0 absolute right-3 text-[10px] text-muted-foreground font-sans transition-opacity hidden md:inline'>
+					{shortcut}
+				</kbd>
+			</div>
+		</Button>
+	);
+}
+
+function SidebarChatHeader({
+	isCollapsed,
+	groupBy,
+	filters,
+	onGroupByChange,
+	onFilterToggle,
+}: {
+	isCollapsed: boolean;
+	groupBy: ChatGroupBy;
+	filters: ChatFilterType[];
+	onGroupByChange: (groupBy: ChatGroupBy) => void;
+	onFilterToggle: (filter: ChatFilterType) => void;
+}) {
+	return (
+		<div className='px-2'>
+			<div
+				className={cn(
+					'flex items-center justify-between relative group transition-[padding,height,background-color] duration-300 pt-[10px] pl-2',
+					isCollapsed ? 'h-9' : '',
+				)}
+			>
+				<div className={cn('transition-[opacity,visibility] duration-300', hideIf(isCollapsed))}>
+					<span className='text-md font-medium'>Chats</span>
+				</div>
+				<ChatFilterMenu
+					groupBy={groupBy}
+					filters={filters}
+					onGroupByChange={onGroupByChange}
+					onFilterToggle={onFilterToggle}
+				/>
+			</div>
+		</div>
+	);
+}
+
+function SidebarNav({
+	isCollapsed,
+	groupBy,
+	filters,
+	isViewer,
+}: {
+	isCollapsed: boolean;
+	groupBy: ChatGroupBy;
+	filters: ChatFilterType[];
+	isViewer: boolean;
+}) {
+	const groupedChats = useQuery({
+		...trpc.chat.listGrouped.queryOptions({ groupBy, filters }),
+		placeholderData: keepPreviousData,
+	});
+	const groups = groupedChats.data?.groups;
+	const isEmpty = groups?.every((group) => group.chats.length === 0);
+	return (
+		<div
+			className={cn(
+				'flex flex-col flex-1 min-h-0 overflow-y-auto transition-[opacity,visibility] duration-300',
+				hideIf(isCollapsed),
+			)}
+		>
+			{groups?.map((group) => (
+				<GroupSection key={group.label} group={group} groupBy={groupBy} />
+			))}
+
+			{isEmpty && (
+				<p className='text-sm text-muted-foreground text-center p-4'>
+					{isViewer ? (
+						'No chats shared with you.'
+					) : (
+						<>
+							No chats yet.
+							<br />
+							Start a new chat!
+						</>
+					)}
+				</p>
+			)}
+		</div>
+	);
+}
+
+function SidebarAutomationsNav({ isCollapsed, enabled }: { isCollapsed: boolean; enabled: boolean }) {
+	const automations = useQuery({
+		...trpc.automation.list.queryOptions(),
+		enabled,
+	});
+	const items = automations.data ?? [];
+
+	if (!enabled || items.length === 0) {
+		return null;
+	}
+
+	return (
+		<div className={cn('transition-[opacity,visibility] duration-300', hideIf(isCollapsed))}>
+			<AutomationsSection items={items} />
+		</div>
+	);
+}
+
+function AutomationsSection({
+	items,
+}: {
+	items: Array<{
+		id: string;
+		title: string;
+		enabled: boolean;
+		cron: string;
+		webhookEnabled: boolean;
+		updatedAt: Date;
+	}>;
+}) {
+	const { isOpen, toggle } = useSidebarSectionOpen('section:automations');
+
+	if (items.length === 0) {
+		return null;
+	}
+
+	return (
+		<>
+			<div className='px-2'>
+				<button
+					type='button'
+					onClick={toggle}
+					className='group flex items-center gap-2 w-full text-left pt-[10px] pb-1.5 pl-2 cursor-pointer'
+				>
+					<span className='text-md font-medium'>Automations</span>
+					<ChevronRight
+						className={cn(
+							'size-4 shrink-0 transition-[transform,opacity,rotate] duration-200 group-hover:opacity-100',
+							isOpen ? 'opacity-100 rotate-90' : 'opacity-0 rotate-0',
+						)}
+					/>
+				</button>
+			</div>
+			{isOpen && (
+				<div className='px-2 space-y-1 max-h-48 overflow-y-auto'>
+					{items.map((item) => (
+						<AutomationListItem key={item.id} item={item} />
+					))}
+				</div>
+			)}
+		</>
+	);
+}
+
+function AutomationListItem({
+	item,
+}: {
+	item: {
+		id: string;
+		title: string;
+		enabled: boolean;
+		cron: string;
+		webhookEnabled: boolean;
+		updatedAt: Date;
+	};
+}) {
+	const timeAgo = useTimeAgo(new Date(item.updatedAt).getTime());
+	const hasSchedule = Boolean(item.cron);
+	const isActive = hasSchedule ? item.enabled : item.webhookEnabled;
+	const statusLabel = hasSchedule
+		? item.enabled
+			? timeAgo.humanReadable
+			: 'paused'
+		: item.webhookEnabled
+			? 'webhook'
+			: 'paused';
+
+	return (
+		<Link
+			params={{ automationId: item.id }}
+			to='/automations/$automationId'
+			className='group relative w-full rounded-md px-2 py-2 transition-[background-color,padding,opacity] min-w-0 flex-1 flex gap-2 items-center'
+			inactiveProps={{ className: 'text-sidebar-foreground hover:bg-sidebar-accent opacity-75' }}
+			activeProps={{ className: 'text-foreground bg-sidebar-accent font-medium' }}
+		>
+			<div className='truncate text-sm mr-auto'>{item.title}</div>
+			<div
+				className={cn(
+					'text-xs whitespace-nowrap',
+					isActive ? 'text-muted-foreground' : 'text-muted-foreground/60',
+				)}
+			>
+				{statusLabel}
+			</div>
+		</Link>
+	);
+}
+
+const GROUP_INITIAL_COUNT = 10;
+
+function GroupSection({ group, groupBy }: { group: ChatGroup; groupBy: ChatGroupBy }) {
+	const { isOpen, toggle } = useSidebarSectionOpen(`section:chat-group:${group.label}`);
+	const [expanded, setExpanded] = useState(false);
+	const hasMore = group.chats.length > GROUP_INITIAL_COUNT;
+	const visibleChats = expanded ? group.chats : group.chats.slice(0, GROUP_INITIAL_COUNT);
+
+	if (group.chats.length === 0) {
+		return null;
+	}
+
+	const showChats = group.label ? isOpen : true;
+
+	return (
+		<>
+			{group.label && (
+				<div className='px-2'>
+					<SidebarSectionHeader label={group.label} isOpen={isOpen} onToggle={toggle} />
+				</div>
+			)}
+
+			{showChats && (
+				<div className='px-2 space-y-1'>
+					{visibleChats.map((item) =>
+						item.kind === 'shared' ? (
+							<SharedChatGroupItem key={`shared-${item.shareId}`} item={item} groupBy={groupBy} />
+						) : (
+							<ChatListItem key={item.id} chat={item} />
+						),
+					)}
+
+					{hasMore && (
+						<button
+							type='button'
+							onClick={() => setExpanded((p) => !p)}
+							className='px-2 py-1 text-xs text-muted-foreground cursor-pointer transition-colors hover:text-foreground'
+						>
+							{expanded ? 'Show less' : 'Show more'}
+						</button>
+					)}
+				</div>
+			)}
+		</>
+	);
+}
+
+function SharedChatGroupItem({ item, groupBy }: { item: GroupedChatItem; groupBy: ChatGroupBy }) {
+	const timeAgo = useTimeAgo(item.updatedAt);
+
+	return (
+		<Link
+			params={{ shareId: item.shareId! }}
+			to='/shared-chat/$shareId'
+			className='group relative w-full rounded-md px-2 py-2 transition-[background-color,padding,opacity] min-w-0 flex-1 flex gap-2 items-center'
+			inactiveProps={{ className: 'text-sidebar-foreground hover:bg-sidebar-accent opacity-75' }}
+			activeProps={{ className: 'text-foreground bg-sidebar-accent font-medium' }}
+		>
+			<div className='truncate text-sm mr-auto'>{item.title}</div>
+			<div className='text-xs text-muted-foreground whitespace-nowrap'>
+				{groupBy === 'ownership' ? timeAgo.humanReadable : `by ${item.ownerName}`}
+			</div>
+		</Link>
+	);
+}
+
+function SidebarSectionHeader({
+	label,
+	isOpen,
+	onToggle,
+	activity,
+	extra,
+}: {
+	label: string;
+	isOpen: boolean;
+	onToggle: () => void;
+	activity?: { running: boolean; unread: boolean };
+	extra?: React.ReactNode;
+}) {
+	const showIndicator = !isOpen && activity;
+
+	return (
+		<button
+			onClick={onToggle}
+			className='group relative flex items-center gap-2 px-2 py-1.5 text-sm rounded-md transition-colors w-full text-left text-muted-foreground whitespace-nowrap cursor-pointer'
+		>
+			<span>{label}</span>
+			<ChevronRight
+				className={cn(
+					'size-4 shrink-0 transition-[transform,opacity,rotate] duration-200 group-hover:opacity-100',
+					isOpen ? 'opacity-100 rotate-90' : 'opacity-0 rotate-0',
+				)}
+			/>
+			<div className='absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-2'>
+				{showIndicator && activity.running && <Spinner className='size-3' />}
+				{showIndicator && !activity.running && activity.unread && (
+					<span className='size-1.5 rounded-full bg-primary' />
+				)}
+				{!showIndicator && extra}
+			</div>
+		</button>
+	);
+}

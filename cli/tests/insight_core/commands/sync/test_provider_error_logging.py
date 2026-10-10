@@ -1,0 +1,203 @@
+"""Test that template rendering errors are logged to CLI and connections are cleaned up."""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from insight_core.commands.sync.providers.databases.provider import sync_database
+from insight_core.config.databases.base import DatabaseTemplate
+
+
+@pytest.fixture
+def mock_progress():
+    """Create a mock progress object."""
+    mock = MagicMock()
+    mock.add_task.return_value = "task_id"
+    return mock
+
+
+def create_mock_db_config(
+    name="test_db",
+    db_type="duckdb",
+    database_name="test_database",
+    schemas=None,
+    tables=None,
+):
+    """Create a mock database config with customizable parameters."""
+    schemas = schemas or ["test_schema"]
+    tables = tables or ["test_table"]
+
+    mock_config = MagicMock()
+    mock_config.name = name
+    mock_config.type = db_type
+    mock_config.templates = list(DatabaseTemplate)
+    mock_conn = MagicMock()
+    mock_config.connect.return_value = mock_conn
+    mock_config.get_database_name.return_value = database_name
+    mock_config.get_schemas.return_value = schemas
+    mock_config.matches_pattern.return_value = True
+    mock_conn.list_tables.return_value = tables
+
+    return mock_config
+
+
+def create_mock_engine(templates, render_behavior):
+    """Create a mock template engine with customizable behavior."""
+    mock = MagicMock()
+    mock.list_templates.return_value = templates
+    mock.render.side_effect = render_behavior
+    return mock
+
+
+def run_sync_with_mocks(db_config, engine, tmp_path, progress):
+    """Run sync_database with patched console and engine, return state and console mock."""
+    with patch("insight_core.commands.sync.providers.databases.provider.UI._console") as mock_console:
+        with patch(
+            "insight_core.commands.sync.providers.databases.provider.get_template_engine",
+            return_value=engine,
+        ):
+            state = sync_database(db_config, tmp_path, progress, None)
+    return state, mock_console
+
+
+class TestSyncDatabaseErrorLogging:
+    """Test suite for error logging during database sync operations."""
+
+    def test_sync_database_logs_template_errors_to_console(self, tmp_path, mock_progress):
+        """Test that template rendering errors are logged to CLI console."""
+        db_config = create_mock_db_config()
+        engine = create_mock_engine(
+            templates=["databases/preview.md.j2"],
+            render_behavior=RuntimeError("Database connection failed!"),
+        )
+
+        _, mock_console = run_sync_with_mocks(db_config, engine, tmp_path, mock_progress)
+
+        # Verify console was called with error
+        mock_console.print.assert_called()
+        # console.print is called multiple times (connection, schemas, progress, error, summary).
+        # The error line with [bold red]✗[/bold red] is not the last call,
+        # so we search call_args_list instead of call_args (which only returns the last call).
+        all_output = [call.args[0] for call in mock_console.print.call_args_list if call.args]
+        error_lines = [line for line in all_output if "[bold red]✗[/bold red]" in line]
+        assert len(error_lines) == 1, f"Expected exactly 1 error line, got {len(error_lines)}"
+        error_msg = error_lines[0]
+        assert "preview" in error_msg
+        assert "test_schema.test_table" in error_msg
+        assert "Database connection failed!" in error_msg
+
+        # Verify file still written with error content
+        preview_file = (
+            tmp_path
+            / "type=duckdb"
+            / "database=test_database"
+            / "schema=test_schema"
+            / "table=test_table"
+            / "preview.md"
+        )
+        assert preview_file.exists()
+        content = preview_file.read_text()
+        assert "Error generating content" in content
+        assert "Database connection failed!" in content
+
+    def test_sync_database_logs_context_method_errors_to_console(self, tmp_path, mock_progress):
+        """Test that DatabaseContext method errors are logged to CLI console."""
+        db_config = create_mock_db_config(
+            db_type="postgres",
+            database_name="analytics",
+            schemas=["public"],
+            tables=["users"],
+        )
+        engine = create_mock_engine(
+            templates=["databases/columns.md.j2"],
+            render_behavior=ValueError("Column metadata not available"),
+        )
+
+        _, mock_console = run_sync_with_mocks(db_config, engine, tmp_path, mock_progress)
+
+        # Verify console was called with error
+        mock_console.print.assert_called()
+        all_output = [call.args[0] for call in mock_console.print.call_args_list if call.args]
+        error_lines = [line for line in all_output if "[bold red]✗[/bold red]" in line]
+        assert len(error_lines) == 1, f"Expected exactly 1 error line, got {len(error_lines)}"
+        error_msg = error_lines[0]
+        assert "columns" in error_msg
+        assert "public.users" in error_msg
+        assert "Column metadata not available" in error_msg
+
+        # Verify file still written with error content
+        columns_file = (
+            tmp_path / "type=postgres" / "database=analytics" / "schema=public" / "table=users" / "columns.md"
+        )
+        assert columns_file.exists()
+        content = columns_file.read_text()
+        assert "Error generating content" in content
+
+    def test_sync_database_error_message_format(self, tmp_path, mock_progress):
+        """Test that error messages contain all expected parts."""
+        db_config = create_mock_db_config(
+            name="prod_db",
+            db_type="snowflake",
+            database_name="PRODUCTION",
+            schemas=["ANALYTICS"],
+            tables=["CUSTOMERS"],
+        )
+        engine = create_mock_engine(
+            templates=["databases/columns.md.j2"],
+            render_behavior=Exception("Test error message"),
+        )
+
+        _, mock_console = run_sync_with_mocks(db_config, engine, tmp_path, mock_progress)
+
+        # Verify error message contains all expected parts
+        mock_console.print.assert_called()
+        all_output = [call.args[0] for call in mock_console.print.call_args_list if call.args]
+        error_lines = [line for line in all_output if "[bold red]✗[/bold red]" in line]
+        assert len(error_lines) == 1, f"Expected exactly 1 error line, got {len(error_lines)}"
+        error_msg = error_lines[0]
+
+        # Should have accessor name
+        assert "columns" in error_msg
+        # Should have schema.table identifier
+        assert "ANALYTICS.CUSTOMERS" in error_msg
+        # Should have the actual error message
+        assert "Test error message" in error_msg
+
+
+class TestSyncDatabaseConnectionCleanup:
+    """Test that database connections are always closed after sync."""
+
+    def test_connection_closed_after_successful_sync(self, tmp_path, mock_progress):
+        db_config = create_mock_db_config()
+        mock_conn = db_config.connect.return_value
+        engine = create_mock_engine(
+            templates=["databases/columns.md.j2"],
+            render_behavior=lambda *a, **kw: "# test",
+        )
+
+        run_sync_with_mocks(db_config, engine, tmp_path, mock_progress)
+
+        mock_conn.disconnect.assert_called_once()
+
+    def test_connection_closed_after_template_error(self, tmp_path, mock_progress):
+        db_config = create_mock_db_config()
+        mock_conn = db_config.connect.return_value
+        engine = create_mock_engine(
+            templates=["databases/columns.md.j2"],
+            render_behavior=RuntimeError("Render failed"),
+        )
+
+        run_sync_with_mocks(db_config, engine, tmp_path, mock_progress)
+
+        mock_conn.disconnect.assert_called_once()
+
+    def test_connection_closed_after_schema_listing_error(self, tmp_path, mock_progress):
+        db_config = create_mock_db_config()
+        mock_conn = db_config.connect.return_value
+        db_config.get_schemas.side_effect = RuntimeError("Cannot list schemas")
+        engine = create_mock_engine(templates=[], render_behavior=None)
+
+        with pytest.raises(RuntimeError, match="Cannot list schemas"):
+            run_sync_with_mocks(db_config, engine, tmp_path, mock_progress)
+
+        mock_conn.disconnect.assert_called_once()

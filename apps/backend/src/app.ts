@@ -1,0 +1,509 @@
+import './instrumentation';
+
+import formbody from '@fastify/formbody';
+import multipart from '@fastify/multipart';
+import fastifyStatic from '@fastify/static';
+import { STORY_FRAME_CORS_HEADERS, STORY_FRAME_ORIGIN, STORY_RUNTIME_PATH } from '@insight/shared/story-app';
+import { fastifyTRPCPlugin, FastifyTRPCPluginOptions } from '@trpc/server/adapters/fastify';
+import fastify, { FastifyReply, FastifyRequest } from 'fastify';
+import fastifyRawBody from 'fastify-raw-body';
+import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
+
+import { env, isCloud, isCloudBillingEnabled } from './env';
+import { AUTOMATION_JOB_NAME, automationHandler } from './handlers/automation.handler';
+import { BILLING_LIFECYCLE_JOB_NAME, billingLifecycleHandler } from './handlers/billing-lifecycle.handler';
+import {
+	CONTEXT_BRANCH_CLEANUP_JOB_NAME,
+	contextBranchCleanupHandler,
+} from './handlers/context-branch-cleanup.handler';
+import {
+	CONTEXT_RECOMMENDATIONS_JOB_NAME,
+	contextRecommendationsHandler,
+	ensureContextRecommendationsSchedules,
+} from './handlers/context-recommendations.handler';
+import {
+	INVITATION_CLEANUP_JOB_NAME,
+	invitationCleanupHandler,
+	runInvitationCleanup,
+} from './handlers/invitation-cleanup.handler';
+import { LOG_CLEANUP_JOB_NAME, logCleanupHandler, runLogCleanup } from './handlers/log-cleanup.handler';
+import { MCP_QUERY_DATA_CLEANUP_JOB_NAME, mcpQueryDataCleanupHandler } from './handlers/mcp-query-data-cleanup.handler';
+import { STORY_BLOB_CLEANUP_JOB_NAME, storyBlobCleanupHandler } from './handlers/story-blob-cleanup.handler';
+import { STORY_DELIVERY_JOB_NAME, storyDeliveryHandler } from './handlers/story-delivery.handler';
+import { STORY_REFRESH_JOB_NAME, storyRefreshHandler } from './handlers/story-refresh.handler';
+import { STRIPE_WEBHOOK_PROCESS_JOB_NAME, stripeWebhookProcessHandler } from './handlers/stripe-webhook.handler';
+import { flushTelemetry } from './instrumentation';
+import { mcpServerRoutes } from './mcp/routes';
+import { ensureOrganizationSetup } from './queries/organization.queries';
+import { agentRoutes } from './routes/agent';
+import { analyticsRoutes } from './routes/analytics';
+import { attachmentRoutes } from './routes/attachment';
+import { authRoutes } from './routes/auth';
+import { authErrorRedirectRoutes } from './routes/auth-error-redirect';
+import { automationWebhookRoutes } from './routes/automation-webhook';
+import { brandingRoutes } from './routes/branding';
+import { chartRoutes } from './routes/chart';
+import { cliAuthRoutes } from './routes/cli-auth';
+import { deployRoutes } from './routes/deploy';
+import { embedStoryDownloadRoutes } from './routes/embed-story-download';
+import { githubRoutes } from './routes/github';
+import { gitlabRoutes } from './routes/gitlab';
+import { imageRoutes } from './routes/image';
+import { mapBoundariesRoutes } from './routes/map-boundaries';
+import { mattermostRoutes } from './routes/mattermost';
+import { mcpOAuthRoutes } from './routes/mcp-oauth';
+import { notificationUnsubscribeRoutes } from './routes/notification-unsubscribe';
+import { slackRoutes } from './routes/slack';
+import { ssoRoutes } from './routes/sso';
+import { stripeWebhookRoutes } from './routes/stripe-webhook';
+import { teamsRoutes } from './routes/teams';
+import { telegramRoutes } from './routes/telegram';
+import { testRoutes } from './routes/test';
+import { whatsappRoutes } from './routes/whatsapp';
+import { startLicenseHeartbeat } from './services/license.service';
+import { logLicenseStatus } from './services/license-startup';
+import { mattermostService } from './services/mattermost';
+import { pingLicensesServer } from './services/ping';
+import { posthog, PostHogEvent } from './services/posthog';
+import { ensureRecurring, registerJob, startScheduler, stopScheduler } from './services/scheduler.service';
+import { slackService } from './services/slack';
+import { seedSlackConfigFromEnv } from './services/slack-env-seed';
+import { validateCloudBillingConfiguration } from './services/stripe.service';
+import { TrpcRouter, trpcRouter } from './trpc/router';
+import { createContext } from './trpc/trpc';
+import { BudgetExceededError, HandlerError } from './utils/error';
+import { closeBrowser } from './utils/headless-browser';
+import { logger } from './utils/logger';
+import { drainInFlightRequests, isDraining, trackInFlightRequests } from './utils/request-drain';
+import { FRONTEND_DEV_ORIGIN, staticRoot } from './utils/static-root';
+
+const isDev = env.MODE !== 'prod';
+const HEALTH_PATH = '/api/health';
+// pino-pretty transport uses worker threads and can't be resolved inside a Bun-compiled binary.
+// Unix path: /$bunfs/root/..., Windows path: B:/~BUN/root/...
+const isCompiled = typeof Bun !== 'undefined' && /(\$bunfs|~BUN)/.test(Bun.main);
+
+const app = fastify({
+	logger:
+		isDev && !isCompiled
+			? {
+					transport: {
+						target: 'pino-pretty',
+						options: {
+							colorize: true,
+							ignore: 'pid,hostname',
+							translateTime: 'HH:MM:ss',
+						},
+					},
+				}
+			: true,
+	bodyLimit: 35 * 1024 * 1024, // ~25 MB audio * 4/3 base64 overhead + JSON envelope
+	routerOptions: { maxParamLength: 2048 },
+	trustProxy: true,
+}).withTypeProvider<ZodTypeProvider>();
+export type App = typeof app;
+
+// Set the validator and serializer compilers for the Zod type provider
+app.setValidatorCompiler(validatorCompiler);
+app.setSerializerCompiler(serializerCompiler);
+
+trackInFlightRequests(app);
+
+// Map HandlerError to HTTP status code
+app.setErrorHandler((error, request, reply) => {
+	const message = error instanceof Error ? error.message : String(error);
+	const statusCode =
+		typeof (error as Record<string, unknown>).statusCode === 'number'
+			? (error as Record<string, unknown>).statusCode
+			: undefined;
+	logger.error(message, {
+		source: 'http',
+		context: { method: request.method, url: request.url, statusCode },
+	});
+	if (error instanceof BudgetExceededError) {
+		return reply.status(error.code).send({ error: error.message, code: 'BUDGET_EXCEEDED' });
+	}
+	if (error instanceof HandlerError) {
+		return reply.status(error.code).send({ error: error.message });
+	}
+	throw error;
+});
+
+// Log HTTP requests to the database (skip log-polling to avoid self-referential noise)
+app.addHook('onResponse', (request, reply, done) => {
+	if (request.url.includes('log.listLogs') || request.url === HEALTH_PATH) {
+		done();
+		return;
+	}
+	if (reply.statusCode >= 400) {
+		done();
+		return;
+	}
+	logger.info(`${request.method} ${request.url} ${reply.statusCode}`, {
+		source: 'http',
+		context: { method: request.method, url: request.url, statusCode: reply.statusCode, elapsed: reply.elapsedTime },
+	});
+	done();
+});
+
+// Register raw body plugin for Slack signature verification
+app.register(fastifyRawBody, {
+	field: 'rawBody',
+	global: false,
+	runFirst: true,
+});
+
+// Register formbody plugin for Slack interaction payloads (application/x-www-form-urlencoded)
+app.register(formbody);
+
+// Register multipart plugin for file uploads (deploy endpoint)
+app.register(multipart, { limits: { fileSize: 100 * 1024 * 1024 } });
+
+// Register tRPC plugin
+app.register(fastifyTRPCPlugin, {
+	prefix: '/api/trpc',
+	trpcOptions: {
+		router: trpcRouter,
+		createContext,
+		onError({ path, error }) {
+			logger.error(`tRPC error on ${path}: ${error.message}`, {
+				source: 'http',
+				context: { path, code: error.code },
+			});
+		},
+	} satisfies FastifyTRPCPluginOptions<TrpcRouter>['trpcOptions'],
+});
+
+app.register(agentRoutes, {
+	prefix: '/api/agent',
+});
+
+app.register(attachmentRoutes, {
+	prefix: '/api/attachments',
+});
+
+app.register(analyticsRoutes, {
+	prefix: '/api/analytics',
+});
+
+app.register(testRoutes, {
+	prefix: '/api/test',
+});
+
+app.register(cliAuthRoutes, {
+	prefix: '/api/cli-auth',
+});
+
+app.register(chartRoutes, {
+	prefix: '/c',
+});
+
+app.register(mapBoundariesRoutes, {
+	prefix: '/api/map-boundaries',
+});
+
+app.register(imageRoutes, {
+	prefix: '/i',
+});
+
+app.register(brandingRoutes, {
+	prefix: '/branding',
+});
+
+app.register(authErrorRedirectRoutes, {
+	prefix: '/api',
+});
+
+app.register(embedStoryDownloadRoutes, {
+	prefix: '/api/embed',
+});
+
+app.register(notificationUnsubscribeRoutes, {
+	prefix: '/api/notifications',
+});
+
+app.register(authRoutes, {
+	prefix: '/api',
+});
+
+app.register(ssoRoutes, {
+	prefix: '/api',
+});
+
+app.register(slackRoutes, {
+	prefix: '/api/webhooks/slack',
+});
+
+app.register(teamsRoutes, {
+	prefix: '/api/webhooks/teams',
+});
+
+app.register(telegramRoutes, {
+	prefix: '/api/webhooks/telegram',
+});
+
+app.register(mattermostRoutes, {
+	prefix: '/api/webhooks/mattermost',
+});
+
+app.register(whatsappRoutes, {
+	prefix: '/api/webhooks/whatsapp',
+});
+
+if (isCloudBillingEnabled()) {
+	app.register(stripeWebhookRoutes, {
+		prefix: '/api/billing/stripe/webhook',
+	});
+}
+
+app.register(deployRoutes, {
+	prefix: '/api',
+});
+
+app.register(automationWebhookRoutes, {
+	prefix: '/api',
+});
+
+app.register(githubRoutes, {
+	prefix: '/api/github',
+});
+
+app.register(gitlabRoutes, {
+	prefix: '/api/gitlab',
+});
+
+app.register(mcpOAuthRoutes, {
+	prefix: '/api/mcp-oauth',
+});
+
+app.register(mcpServerRoutes, {
+	prefix: '/mcp',
+});
+
+async function sendProtectedResourceMetadata(request: { host: string }, reply: FastifyReply) {
+	const { buildProtectedResourceMetadata } = await import('./auth');
+	const { resolveMcpFacingOrigin } = await import('./env');
+	const metadata = await buildProtectedResourceMetadata({
+		resource: `${resolveMcpFacingOrigin(request.host)}/mcp`,
+	});
+	reply
+		.status(200)
+		.header('Content-Type', 'application/json')
+		.header('Cache-Control', 'public, max-age=15, stale-while-revalidate=15, stale-if-error=86400')
+		.send(metadata);
+}
+
+// RFC 9728 path-aware discovery for the bare and project-scoped MCP URLs, plus the root fallback.
+app.get('/.well-known/oauth-protected-resource', sendProtectedResourceMetadata);
+app.get('/.well-known/oauth-protected-resource/mcp', sendProtectedResourceMetadata);
+app.get('/.well-known/oauth-protected-resource/mcp/:projectId', sendProtectedResourceMetadata);
+
+async function relayWebResponse(
+	handler: (req: Request) => Promise<Response>,
+	request: { url: string; headers: Record<string, string | string[] | undefined> },
+	reply: FastifyReply,
+) {
+	const url = new URL(request.url, env.BETTER_AUTH_URL);
+	const { convertHeaders } = await import('./utils/utils');
+	const response = await handler(new Request(url, { method: 'GET', headers: convertHeaders(request.headers) }));
+	reply.status(response.status);
+	response.headers.forEach((value, key) => reply.header(key, value));
+	reply.send(await response.text());
+}
+
+async function relayAuthServerMetadata(request: Parameters<typeof relayWebResponse>[1], reply: FastifyReply) {
+	const { getAuthServerMetadataHandler } = await import('./auth');
+	const handler = await getAuthServerMetadataHandler();
+	await relayWebResponse(handler, request, reply);
+}
+
+async function relayOpenIdConfigMetadata(request: Parameters<typeof relayWebResponse>[1], reply: FastifyReply) {
+	const { getOpenIdConfigMetadataHandler } = await import('./auth');
+	const handler = await getOpenIdConfigMetadataHandler();
+	await relayWebResponse(handler, request, reply);
+}
+
+app.get('/.well-known/oauth-authorization-server/api/auth', relayAuthServerMetadata);
+app.get('/.well-known/openid-configuration/api/auth', relayOpenIdConfigMetadata);
+app.get('/api/auth/.well-known/openid-configuration', relayOpenIdConfigMetadata);
+app.get('/.well-known/oauth-authorization-server', relayAuthServerMetadata);
+app.get('/.well-known/openid-configuration', relayOpenIdConfigMetadata);
+
+/**
+ * Tests the API connection
+ */
+app.get('/api', async () => {
+	return 'Welcome to the API!';
+});
+
+app.get(HEALTH_PATH, { logLevel: 'silent' }, async (_request, reply) => {
+	if (isDraining()) {
+		return reply.status(503).send({ status: 'draining' });
+	}
+	return { status: 'ok' };
+});
+
+const isReservedBackendPath = (url: string) => {
+	const pathname = url.split('?', 1)[0];
+	return (
+		pathname === '/api' ||
+		pathname.startsWith('/api/') ||
+		pathname === '/c' ||
+		pathname.startsWith('/c/') ||
+		pathname === '/i' ||
+		pathname.startsWith('/i/') ||
+		pathname === '/branding' ||
+		pathname.startsWith('/branding/') ||
+		pathname === '/mcp' ||
+		pathname.startsWith('/mcp/') ||
+		pathname.startsWith('/.well-known/')
+	);
+};
+
+console.log('Static root:', staticRoot || 'Not found (API-only mode)');
+
+/** Only the sandboxed custom-story frame (opaque origin) gets CORS access, and only to the story runtime modules. */
+const isStoryFrameRuntimeRequest = (request: FastifyRequest) =>
+	request.headers.origin === STORY_FRAME_ORIGIN && request.url.startsWith(`${STORY_RUNTIME_PATH}/`);
+
+app.addHook('onRequest', async (request, reply) => {
+	if (isStoryFrameRuntimeRequest(request)) {
+		reply.headers(STORY_FRAME_CORS_HEADERS);
+	}
+});
+
+app.options(`${STORY_RUNTIME_PATH}/*`, (_request, reply) => {
+	reply.header('Access-Control-Allow-Methods', 'GET, HEAD').status(204).send();
+});
+
+if (staticRoot) {
+	app.register(fastifyStatic, {
+		root: staticRoot,
+		prefix: '/',
+		wildcard: false,
+	});
+}
+
+// SPA fallback: serve index.html for all non-API routes.
+// In dev mode without a built frontend, redirect to the Vite dev server.
+app.setNotFoundHandler((request, reply) => {
+	if (isReservedBackendPath(request.url)) {
+		reply.status(404).send({ error: 'Not found' });
+	} else if (staticRoot) {
+		reply.sendFile('index.html');
+	} else if (isDev) {
+		reply.redirect(`${FRONTEND_DEV_ORIGIN}${request.url}`);
+	} else {
+		reply.status(404).send({ error: 'Not found' });
+	}
+});
+
+export const startServer = async (opts: { port: number; host: string }) => {
+	if (isCloudBillingEnabled()) {
+		await validateCloudBillingConfiguration();
+	}
+	if (!isCloud) {
+		await ensureOrganizationSetup();
+	}
+	await logLicenseStatus();
+
+	void runLogCleanup().catch((err) => {
+		logger.error(`Log cleanup failed: ${err instanceof Error ? err.message : String(err)}`, { source: 'system' });
+	});
+	void runInvitationCleanup().catch((err) => {
+		logger.error(`Invitation cleanup failed: ${err instanceof Error ? err.message : String(err)}`, {
+			source: 'system',
+		});
+	});
+
+	registerJob(LOG_CLEANUP_JOB_NAME, logCleanupHandler);
+	await ensureRecurring({ name: LOG_CLEANUP_JOB_NAME, cron: '0 3 * * *', uniqueKey: LOG_CLEANUP_JOB_NAME });
+
+	registerJob(INVITATION_CLEANUP_JOB_NAME, invitationCleanupHandler);
+	await ensureRecurring({
+		name: INVITATION_CLEANUP_JOB_NAME,
+		cron: '0 3 * * *',
+		uniqueKey: INVITATION_CLEANUP_JOB_NAME,
+	});
+
+	registerJob(AUTOMATION_JOB_NAME, automationHandler);
+	registerJob(STORY_REFRESH_JOB_NAME, storyRefreshHandler);
+	registerJob(STORY_DELIVERY_JOB_NAME, storyDeliveryHandler);
+	if (isCloudBillingEnabled()) {
+		// Process accepted webhooks in the background so Stripe receives an immediate response.
+		registerJob(STRIPE_WEBHOOK_PROCESS_JOB_NAME, stripeWebhookProcessHandler);
+		registerJob(BILLING_LIFECYCLE_JOB_NAME, billingLifecycleHandler);
+		await ensureRecurring({
+			name: BILLING_LIFECYCLE_JOB_NAME,
+			cron: '0 * * * *',
+			uniqueKey: BILLING_LIFECYCLE_JOB_NAME,
+		});
+	}
+
+	registerJob(MCP_QUERY_DATA_CLEANUP_JOB_NAME, mcpQueryDataCleanupHandler);
+	await ensureRecurring({
+		name: MCP_QUERY_DATA_CLEANUP_JOB_NAME,
+		cron: '0 4 * * *',
+		uniqueKey: MCP_QUERY_DATA_CLEANUP_JOB_NAME,
+	});
+
+	registerJob(STORY_BLOB_CLEANUP_JOB_NAME, storyBlobCleanupHandler);
+	await ensureRecurring({
+		name: STORY_BLOB_CLEANUP_JOB_NAME,
+		cron: '30 4 * * *',
+		uniqueKey: STORY_BLOB_CLEANUP_JOB_NAME,
+	});
+
+	registerJob(CONTEXT_BRANCH_CLEANUP_JOB_NAME, contextBranchCleanupHandler);
+	await ensureRecurring({
+		name: CONTEXT_BRANCH_CLEANUP_JOB_NAME,
+		cron: '0 5 * * *',
+		uniqueKey: CONTEXT_BRANCH_CLEANUP_JOB_NAME,
+	});
+
+	if (env.BETA_CONTEXT_RECOMMENDATIONS_ENABLED) {
+		registerJob(CONTEXT_RECOMMENDATIONS_JOB_NAME, contextRecommendationsHandler);
+		try {
+			await ensureContextRecommendationsSchedules();
+		} catch (err) {
+			logger.error(
+				`Failed to register context recommendations schedules: ${err instanceof Error ? err.message : String(err)}`,
+				{ source: 'system' },
+			);
+		}
+	}
+
+	startScheduler();
+	await startLicenseHeartbeat();
+
+	const address = await app.listen({ host: opts.host, port: opts.port });
+	app.log.info(`Server is running on ${address}`);
+
+	void pingLicensesServer();
+	void seedSlackConfigFromEnv().then(() => slackService.startSocketModeForAllProjects());
+	void mattermostService.startForAllProjects();
+
+	posthog.capture(undefined, PostHogEvent.ServerStarted, { ...opts, address });
+
+	const handleShutdown = async () => {
+		await closeBrowser();
+		await flushTelemetry();
+		await posthog.shutdown();
+		process.exit(0);
+	};
+
+	const handleGracefulShutdown = async () => {
+		if (isDraining()) {
+			return;
+		}
+		stopScheduler();
+		await drainInFlightRequests(env.SHUTDOWN_DRAIN_DELAY_MS);
+		await handleShutdown();
+	};
+
+	// SIGINT (Ctrl-C) skips draining so stopping a dev server with an open stream stays instant.
+	process.on('SIGINT', handleShutdown);
+	process.on('SIGTERM', handleGracefulShutdown);
+};
+
+export default app;

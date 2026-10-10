@@ -1,0 +1,160 @@
+import type { LlmSelectedModel } from '@insight/shared/types';
+import { generateText, Output } from 'ai';
+import { z } from 'zod/v4';
+
+import { llmTelemetry } from '../agents/telemetry';
+import type { UIMessage } from '../types/chat';
+import type { ModelCosts } from '../types/llm';
+import { AgentRunResult, AgentService } from './agent';
+import { assertProjectCloudBillingAccess } from './cloud-billing-access.service';
+import { runSqlOverQueryResults } from './duckdb.service';
+import { buildVerificationMessages } from './test-agent-verification';
+
+export interface VerificationResult {
+	/** Rows the verification query returned, or null when no answer could be produced */
+	data: Record<string, unknown>[] | null;
+	/** The DuckDB query the agent wrote over its own query results */
+	sql: string | null;
+	error: string | null;
+}
+
+export interface ToolCallResult {
+	toolName: string;
+	toolCallId: string;
+	args: Record<string, unknown>;
+	result?: unknown;
+}
+
+/** Attempts allowed for the verification query, so a broken one can be repaired once. */
+const MAX_VERIFICATION_ATTEMPTS = 2;
+
+const verificationSchema = z.object({
+	sql: z
+		.nullable(z.string())
+		.describe('DuckDB query over the query result tables. Null if the question cannot be answered from them.'),
+});
+
+export class TestAgentService extends AgentService {
+	/**
+	 * Run a single prompt without persisting to a chat.
+	 * Used for testing/evaluation purposes.
+	 */
+	async runTest(
+		projectId: string,
+		userId: string,
+		prompt: string,
+		modelSelection?: LlmSelectedModel,
+		costs?: ModelCosts,
+	): Promise<AgentRunResult> {
+		const userMessage = TestAgentService._buildUserMessage(prompt);
+
+		const tempChat = {
+			id: crypto.randomUUID(),
+			title: 'Test',
+			createdAt: Date.now(),
+			updatedAt: Date.now(),
+			messages: [userMessage],
+			userId,
+			projectId,
+		};
+
+		const agent = await this.create(tempChat, modelSelection);
+		return agent.generate([userMessage], { costs });
+	}
+
+	/**
+	 * Ask the agent to express its final answer as a DuckDB query over the rows it
+	 * already fetched, then run it. Reusing the stored rows keeps the answer exact
+	 * and costs a few tokens of SQL instead of a full serialisation of the data.
+	 */
+	async runVerification(
+		projectId: string,
+		prompt: string,
+		agentResult: AgentRunResult,
+		expectedColumns: string[],
+		modelSelection?: LlmSelectedModel,
+	): Promise<VerificationResult> {
+		const { queryResults } = agentResult;
+		if (queryResults.size === 0) {
+			return { data: null, sql: null, error: 'The agent did not run any SQL query.' };
+		}
+		await assertProjectCloudBillingAccess(projectId);
+
+		const resolvedSelectedModel = await this._getResolvedLlmSelectedModel(projectId, modelSelection);
+		const modelConfig = await this._getModelConfig(projectId, resolvedSelectedModel);
+
+		const messages = buildVerificationMessages(prompt, agentResult.responseMessages, expectedColumns, queryResults);
+
+		let sql: string | null = null;
+		let error: string | null = null;
+
+		for (let attempt = 0; attempt < MAX_VERIFICATION_ATTEMPTS; attempt++) {
+			const result = await generateText({
+				...modelConfig,
+				output: Output.object({ schema: verificationSchema }),
+				messages,
+				experimental_telemetry: llmTelemetry('insight-test-verification', { projectId }),
+			});
+
+			sql = result.output.sql?.trim() || null;
+			if (!sql) {
+				return { data: null, sql: null, error: 'The agent could not answer from its query results.' };
+			}
+
+			try {
+				const { data } = await runSqlOverQueryResults(queryResults, sql);
+				return { data, sql, error: null };
+			} catch (err) {
+				error = err instanceof Error ? err.message : String(err);
+				messages.push(
+					{ role: 'assistant', content: sql },
+					{ role: 'user', content: TestAgentService._buildRepairPrompt(error) },
+				);
+			}
+		}
+
+		return { data: null, sql, error };
+	}
+
+	private static _buildUserMessage(text: string): UIMessage {
+		return {
+			id: crypto.randomUUID(),
+			role: 'user',
+			parts: [{ type: 'text', text }],
+		};
+	}
+
+	private static _buildRepairPrompt(error: string): string {
+		return `That query failed with: ${error}
+
+Return a corrected DuckDB query, or set sql to null if the tables cannot answer the question.`;
+	}
+
+	/**
+	 * Extract tool calls from agent result steps.
+	 * Collects all tool calls and their results from every step.
+	 */
+	static extractToolCalls(result: AgentRunResult): ToolCallResult[] {
+		const resultByCallId = new Map<string, unknown>();
+		const toolCalls: ToolCallResult[] = [];
+
+		for (const step of result.steps) {
+			for (const tr of step.toolResults) {
+				resultByCallId.set(tr.toolCallId, tr.output);
+			}
+			for (const tc of step.toolCalls) {
+				toolCalls.push({
+					toolName: tc.toolName,
+					toolCallId: tc.toolCallId,
+					args: tc.input as Record<string, unknown>,
+					result: resultByCallId.get(tc.toolCallId),
+				});
+			}
+		}
+
+		return toolCalls;
+	}
+}
+
+// Singleton instance of the test agent service
+export const testAgentService = new TestAgentService();

@@ -1,0 +1,1269 @@
+import json
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+import duckdb
+import main
+import pytest
+import yaml
+from api_models import EnforcedTableAccess
+from fastapi.testclient import TestClient as FastApiTestClient
+from main import app
+from pydantic import ValidationError
+
+INTERNAL_SECRET = "test-internal-secret-at-least-20-characters"
+INTERNAL_HEADERS = {"X-Insight-Internal-Secret": INTERNAL_SECRET}
+UNENFORCED_TABLE_ACCESS = {"enforced": False}
+UNENFORCED_ROW_SECURITY = {"enforced": False}
+
+
+class TestClient(FastApiTestClient):
+    def request(self, method, url, **kwargs):
+        request_json = kwargs.get("json")
+        if (
+            url in {"/execute_sql", "/validate_sql"}
+            and isinstance(request_json, dict)
+            and "row_security" not in request_json
+        ):
+            kwargs["json"] = {
+                **request_json,
+                "row_security": UNENFORCED_ROW_SECURITY,
+            }
+        return super().request(method, url, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def internal_secret(monkeypatch):
+    monkeypatch.setenv("BETTER_AUTH_SECRET", INTERNAL_SECRET)
+
+
+def assert_sql_result(data: dict, *, row_count: int, columns: list[str], expected_data: list[dict]):
+    """Assert that SQL response data matches expected values."""
+    assert data["row_count"] == row_count
+    assert data["columns"] == columns
+    assert len(data["data"]) == row_count
+    assert data["data"] == expected_data
+
+
+@pytest.fixture
+def duckdb_project_folder():
+    """Create a temporary project folder with a DuckDB config."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = {
+            "project_name": "test-project",
+            "databases": [
+                {
+                    "name": "test-duckdb",
+                    "type": "duckdb",
+                    "path": ":memory:",
+                }
+            ],
+        }
+        config_path = Path(tmpdir) / "insight_config.yaml"
+        with config_path.open("w") as f:
+            yaml.dump(config, f)
+        yield tmpdir
+
+
+@pytest.fixture
+def duckdb_project_with_excluded_columns():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database_path = Path(tmpdir) / "test.duckdb"
+        conn = duckdb.connect(str(database_path))
+        conn.execute("CREATE TABLE users (id INTEGER, name VARCHAR, email VARCHAR)")
+        conn.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')")
+        conn.close()
+
+        config = {
+            "project_name": "test-project",
+            "databases": [
+                {
+                    "name": "test-duckdb",
+                    "type": "duckdb",
+                    "path": str(database_path),
+                    "exclude_columns": ["*.email"],
+                }
+            ],
+        }
+        config_path = Path(tmpdir) / "insight_config.yaml"
+        with config_path.open("w") as f:
+            yaml.dump(config, f)
+        catalog_path = Path(tmpdir) / ".meta" / "databases" / "type=duckdb" / "database=test" / "columns.json"
+        catalog_path.parent.mkdir(parents=True)
+        catalog_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "schemas": {
+                        "main": {
+                            "users": [
+                                {"name": "id", "type": "INTEGER"},
+                                {"name": "name", "type": "VARCHAR"},
+                                {"name": "email", "type": "VARCHAR"},
+                            ]
+                        }
+                    },
+                }
+            )
+        )
+        yield tmpdir
+
+
+@pytest.fixture
+def duckdb_project_with_listed_tables_only():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        project_path = Path(tmpdir)
+        database_path = project_path / "test.duckdb"
+        conn = duckdb.connect(str(database_path))
+        conn.execute("CREATE TABLE orders (id INTEGER, total INTEGER)")
+        conn.execute("INSERT INTO orders VALUES (1, 25)")
+        conn.execute("CREATE TABLE users (id INTEGER, name VARCHAR)")
+        conn.execute("INSERT INTO users VALUES (1, 'Alice')")
+        conn.close()
+
+        config = {
+            "project_name": "test-project",
+            "databases": [
+                {
+                    "name": "test-duckdb",
+                    "type": "duckdb",
+                    "path": str(database_path),
+                    "allow_listed_only": True,
+                }
+            ],
+        }
+        config_path = project_path / "insight_config.yaml"
+        with config_path.open("w") as f:
+            yaml.dump(config, f)
+
+        (project_path / "databases" / "type=duckdb" / "database=test" / "schema=main" / "table=orders").mkdir(
+            parents=True
+        )
+        yield tmpdir
+
+
+def test_health_does_not_require_internal_secret():
+    response = TestClient(app).get("/health")
+
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-Insight-Internal-Secret": "wrong-secret"}])
+def test_internal_routes_reject_missing_or_wrong_secret(headers):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+    client.headers.pop("X-Insight-Internal-Secret")
+
+    response = client.post(
+        "/execute_sql",
+        headers=headers,
+        json={
+            "sql": "SELECT 1",
+            "insight_project_folder": "/tmp",
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 401
+
+
+def test_internal_routes_fail_closed_without_configured_secret(monkeypatch):
+    monkeypatch.delenv("BETTER_AUTH_SECRET")
+
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT 1",
+            "insight_project_folder": "/tmp",
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 503
+
+
+@pytest.mark.parametrize(
+    "table_access",
+    [
+        "missing",
+        None,
+        {},
+        {"enforced": 0},
+        {"enforced": 1},
+        {"enforced": "false"},
+        {"enforced": "true", "tables": []},
+        {"enforced": True},
+        {"enforced": False, "tables": []},
+        {
+            "enforced": True,
+            "tables": [
+                {
+                    "database_type": "duckdb",
+                    "database": "test",
+                    "schema": "main",
+                }
+            ],
+        },
+    ],
+)
+@pytest.mark.parametrize("endpoint", ["/execute_sql", "/validate_sql"])
+def test_sql_endpoint_rejects_missing_null_or_malformed_table_access(
+    duckdb_project_folder,
+    table_access,
+    endpoint,
+):
+    request = {
+        "sql": "SELECT 1",
+        "insight_project_folder": duckdb_project_folder,
+    }
+    if table_access != "missing":
+        request["table_access"] = table_access
+
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(endpoint, json=request)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "row_security",
+    [
+        "missing",
+        None,
+        {},
+        {"enforced": 0},
+        {"enforced": "false"},
+        {"enforced": True},
+        {"enforced": False, "tables": []},
+    ],
+)
+@pytest.mark.parametrize("endpoint", ["/execute_sql", "/validate_sql"])
+def test_sql_endpoint_rejects_missing_null_or_malformed_row_security(
+    duckdb_project_folder,
+    row_security,
+    endpoint,
+):
+    request = {
+        "sql": "SELECT 1",
+        "insight_project_folder": duckdb_project_folder,
+        "table_access": UNENFORCED_TABLE_ACCESS,
+    }
+    if row_security != "missing":
+        request["row_security"] = row_security
+
+    response = FastApiTestClient(app, headers=INTERNAL_HEADERS).post(endpoint, json=request)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        {
+            "database_type": " ",
+            "database": "test",
+            "schema": "main",
+            "table": "users",
+            "constraint_columns": ["id"],
+            "access": "none",
+        },
+        {
+            "database_type": "duckdb",
+            "database": "x" * 256,
+            "schema": "main",
+            "table": "users",
+            "constraint_columns": ["id"],
+            "access": "none",
+        },
+        {
+            "database_type": "duckdb",
+            "database": "test",
+            "schema": "main",
+            "table": "users",
+            "constraint_columns": [" "],
+            "access": "none",
+        },
+        {
+            "database_type": "duckdb",
+            "database": "test",
+            "schema": "main",
+            "table": "users",
+            "constraint_columns": ["id", "id"],
+            "access": "none",
+        },
+        {
+            "database_type": "duckdb",
+            "database": "test",
+            "schema": "main",
+            "table": "users",
+            "constraint_columns": [f"column_{index}" for index in range(257)],
+            "access": "none",
+        },
+        {
+            "database_type": "duckdb",
+            "database": "test",
+            "schema": "main",
+            "table": "users",
+            "constraint_columns": ["id"],
+            "access": "none",
+            "unexpected": True,
+        },
+    ],
+)
+@pytest.mark.parametrize("endpoint", ["/execute_sql", "/validate_sql"])
+def test_sql_endpoint_rejects_malformed_row_security_tables(
+    duckdb_project_folder,
+    table,
+    endpoint,
+):
+    response = FastApiTestClient(app, headers=INTERNAL_HEADERS).post(
+        endpoint,
+        json={
+            "sql": "SELECT 1",
+            "insight_project_folder": duckdb_project_folder,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+            "row_security": {"enforced": True, "tables": [table]},
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("endpoint", ["/execute_sql", "/validate_sql"])
+def test_sql_endpoint_allows_empty_enforced_row_security_tables(
+    duckdb_project_folder,
+    endpoint,
+):
+    response = FastApiTestClient(app, headers=INTERNAL_HEADERS).post(
+        endpoint,
+        json={
+            "sql": "SELECT 1",
+            "insight_project_folder": duckdb_project_folder,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+            "row_security": {"enforced": True, "tables": []},
+        },
+    )
+
+    assert response.status_code == 200
+
+
+def test_row_security_request_model_accepts_project_table_limit():
+    table = {
+        "database_type": "duckdb",
+        "database": "test",
+        "schema": "main",
+        "table": "users",
+        "constraint_columns": ["id"],
+        "access": "none",
+    }
+
+    main.EnforcedRowSecurity.model_validate({"enforced": True, "tables": [table] * 10_000})
+    with pytest.raises(ValidationError):
+        main.EnforcedRowSecurity.model_validate({"enforced": True, "tables": [table] * 10_001})
+
+
+def test_table_access_request_model_accepts_project_table_limit():
+    table = {
+        "database_type": "duckdb",
+        "database": "test",
+        "schema": "main",
+        "table": "users",
+    }
+
+    EnforcedTableAccess.model_validate({"enforced": True, "tables": [table] * 10_000})
+    with pytest.raises(ValidationError):
+        EnforcedTableAccess.model_validate(
+            {"enforced": True, "tables": [table] * 10_001}
+        )
+
+
+def test_row_security_request_model_accepts_blocked_table():
+    row_security = main.EnforcedRowSecurity.model_validate(
+        {
+            "enforced": True,
+            "tables": [
+                {
+                    "database_type": "duckdb",
+                    "database": "test",
+                    "schema": "main",
+                    "table": "users",
+                    "constraint_columns": ["id"],
+                    "access": "blocked",
+                    "reason": "Enterprise license is inactive.",
+                }
+            ],
+        }
+    )
+    table = row_security.tables[0]
+
+    assert isinstance(table, main.BlockedRowAccessTable)
+    assert table.access == "blocked"
+    assert table.reason == "Enterprise license is inactive."
+
+
+def test_row_security_request_model_accepts_bounded_aggregate_predicates():
+    table = {
+        "database_type": "duckdb",
+        "database": "test",
+        "schema": "main",
+        "table": "users",
+        "constraint_columns": ["id"],
+        "access": "predicate",
+    }
+
+    main.PredicateRowAccessTable.model_validate({**table, "predicate": "x" * 1_000_000})
+    with pytest.raises(ValidationError):
+        main.PredicateRowAccessTable.model_validate({**table, "predicate": "x" * 1_000_001})
+    with pytest.raises(ValidationError):
+        main.ValidateRowPredicateRequest.model_validate(
+            {
+                "predicate": "x" * 10_001,
+                "constraint_columns": ["id"],
+                "database_type": "duckdb",
+            }
+        )
+
+
+def test_validate_row_predicate_rejects_non_constraint_column():
+    response = FastApiTestClient(app, headers=INTERNAL_HEADERS).post(
+        "/validate_row_predicate",
+        json={
+            "predicate": "other_id = 1",
+            "constraint_columns": ["tenant_id"],
+            "database_type": "duckdb",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "not a configured constraint column" in response.json()["detail"]
+
+
+def test_execute_sql_rejects_extra_table_access_fields(duckdb_project_folder):
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT 1",
+            "insight_project_folder": duckdb_project_folder,
+            "table_access": {"enforced": False, "tables": []},
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def database_config(
+    name: str,
+    *,
+    database_name: str | None = None,
+    database_type: str = "duckdb",
+):
+    return SimpleNamespace(
+        name=name,
+        type=database_type,
+        get_database_name=lambda: database_name or name,
+    )
+
+
+def test_resolve_database_rejects_no_databases():
+    with pytest.raises(main.HTTPException) as error:
+        main._resolve_database(SimpleNamespace(databases=[]), None)
+
+    assert error.value.status_code == 400
+    assert error.value.detail == "No databases configured in insight_config.yaml"
+
+
+def test_resolve_database_rejects_duplicate_connection_names():
+    config = SimpleNamespace(
+        databases=[
+            database_config("duplicate", database_name="first"),
+            database_config("duplicate", database_name="second"),
+        ]
+    )
+
+    with pytest.raises(main.HTTPException) as error:
+        main._resolve_database(config, None)
+
+    assert error.value.status_code == 400
+    assert error.value.detail == "Database connection names must be unique. Duplicate name(s): duplicate"
+
+
+@pytest.mark.parametrize(
+    ("database_id", "message"),
+    [
+        (None, "Multiple databases configured. Please specify database_id."),
+        ("missing", "Database 'missing' not found"),
+    ],
+)
+def test_resolve_database_requires_known_id_for_multiple_databases(
+    database_id: str | None,
+    message: str,
+):
+    config = SimpleNamespace(
+        databases=[
+            database_config("first"),
+            database_config("second"),
+        ]
+    )
+
+    with pytest.raises(main.HTTPException) as error:
+        main._resolve_database(config, database_id)
+
+    assert error.value.status_code == 400
+    assert error.value.detail == {
+        "message": message,
+        "available_databases": ["first", "second"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("database_id", "expected_name", "expected_folder"),
+    [
+        (None, "only", "database=only"),
+        ("second", "second", "database=second"),
+    ],
+)
+def test_resolve_database_selects_database(
+    database_id: str | None,
+    expected_name: str,
+    expected_folder: str,
+):
+    databases = [database_config("only")]
+    if database_id is not None:
+        databases = [database_config("first"), database_config("second")]
+
+    selected, folder = main._resolve_database(SimpleNamespace(databases=databases), database_id)
+
+    assert selected.name == expected_name
+    assert folder == expected_folder
+
+
+def test_resolve_database_uses_connection_name_for_shared_database_name():
+    config = SimpleNamespace(
+        databases=[
+            database_config("shop_a_ro", database_name="retaildb", database_type="mssql"),
+            database_config("shop_b_ro", database_name="retaildb", database_type="mssql"),
+        ]
+    )
+
+    selected, folder = main._resolve_database(config, "shop_b_ro")
+
+    assert selected.name == "shop_b_ro"
+    assert folder == "database=shop_b_ro"
+
+
+def test_resolve_database_rejects_ambiguous_authorization_identity():
+    config = SimpleNamespace(
+        databases=[
+            database_config("first", database_name="shared"),
+            database_config("second", database_name="shared"),
+            database_config("third", database_name="first"),
+        ]
+    )
+
+    with pytest.raises(main.HTTPException) as error:
+        main._resolve_database(config, "first")
+
+    assert error.value.status_code == 400
+    assert error.value.detail == (
+        "Database authorization identity is ambiguous for connection 'first' (duckdb, database=first)."
+    )
+
+
+@pytest.mark.parametrize("endpoint", ["/execute_sql", "/validate_sql"])
+def test_database_authorization_identity_collision_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+):
+    class FakeDatabaseConfig:
+        type = "duckdb"
+        allow_listed_only = False
+        exclude_columns = []
+
+        def __init__(self, name: str, database_name: str):
+            self.name = name
+            self.database_name = database_name
+
+        def get_database_name(self) -> str:
+            return self.database_name
+
+    config = SimpleNamespace(
+        databases=[
+            FakeDatabaseConfig("first", "shared"),
+            FakeDatabaseConfig("second", "shared"),
+            FakeDatabaseConfig("third", "first"),
+        ]
+    )
+    monkeypatch.setattr(
+        main.InsightConfig,
+        "try_load",
+        staticmethod(lambda *args, **kwargs: config),
+    )
+
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(
+        endpoint,
+        json={
+            "sql": "SELECT 1",
+            "insight_project_folder": "/unused",
+            "database_id": "first",
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "authorization identity is ambiguous" in response.json()["detail"]
+
+
+@pytest.fixture
+def shared_database_name_project(tmp_path: Path) -> Path:
+    databases = []
+    for shop, amount in [("shop_a", 10), ("shop_b", 99)]:
+        database_path = tmp_path / shop / "retaildb.duckdb"
+        database_path.parent.mkdir()
+        conn = duckdb.connect(str(database_path))
+        conn.execute(f"CREATE TABLE orders AS SELECT '{shop}' AS shop, {amount} AS amount")
+        conn.close()
+        databases.append({"name": f"{shop}_ro", "type": "duckdb", "path": str(database_path)})
+
+    with (tmp_path / "insight_config.yaml").open("w") as f:
+        yaml.dump({"project_name": "shared-database-name", "databases": databases}, f)
+    return tmp_path
+
+
+@pytest.mark.parametrize(("database_id", "expected_shop"), [("shop_a_ro", "shop_a"), ("shop_b_ro", "shop_b")])
+def test_connections_sharing_database_name_query_their_own_database(
+    shared_database_name_project: Path,
+    database_id: str,
+    expected_shop: str,
+):
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT shop FROM orders",
+            "insight_project_folder": str(shared_database_name_project),
+            "database_id": database_id,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["data"] == [{"shop": expected_shop}]
+
+
+def test_table_access_is_scoped_per_connection_sharing_database_name(shared_database_name_project: Path):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+    request = {
+        "sql": "SELECT shop FROM orders",
+        "insight_project_folder": str(shared_database_name_project),
+        "table_access": {
+            "enforced": True,
+            "tables": [{"database_type": "duckdb", "database": "shop_a_ro", "schema": "main", "table": "orders"}],
+        },
+    }
+
+    allowed = client.post("/execute_sql", json={**request, "database_id": "shop_a_ro"})
+    denied = client.post("/execute_sql", json={**request, "database_id": "shop_b_ro"})
+
+    assert allowed.status_code == 200, allowed.text
+    assert denied.status_code == 400
+    assert "Denied table(s): main.orders" in denied.json()["detail"]
+
+
+def test_duplicate_database_connection_names_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        databases=[
+            SimpleNamespace(name="duplicate", type="duckdb"),
+            SimpleNamespace(name="duplicate", type="postgres"),
+        ]
+    )
+    monkeypatch.setattr(
+        main.InsightConfig,
+        "try_load",
+        staticmethod(lambda *args, **kwargs: config),
+    )
+
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT 1",
+            "insight_project_folder": "/unused",
+            "database_id": "duplicate",
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "connection names must be unique" in response.json()["detail"]
+
+
+def test_sanitized_clickhouse_authorization_collision_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config = SimpleNamespace(
+        databases=[
+            SimpleNamespace(
+                name="analytics prod",
+                type="clickhouse",
+                allow_listed_only=False,
+                exclude_columns=[],
+            ),
+            SimpleNamespace(
+                name="analytics/prod",
+                type="clickhouse",
+                allow_listed_only=False,
+                exclude_columns=[],
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        main.InsightConfig,
+        "try_load",
+        staticmethod(lambda *args, **kwargs: config),
+    )
+
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(
+        "/validate_sql",
+        json={
+            "sql": "SELECT 1",
+            "insight_project_folder": "/unused",
+            "database_id": "analytics prod",
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "authorization identity is ambiguous" in response.json()["detail"]
+
+
+def test_enforced_empty_access_allows_tableless_query(
+    duckdb_project_with_excluded_columns,
+):
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT 1 AS value",
+            "insight_project_folder": duckdb_project_with_excluded_columns,
+            "table_access": {"enforced": True, "tables": []},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+
+
+def test_table_access_is_filtered_to_active_database_folder(
+    duckdb_project_with_excluded_columns,
+):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+    request = {
+        "sql": "SELECT name FROM users",
+        "insight_project_folder": duckdb_project_with_excluded_columns,
+        "table_access": {
+            "enforced": True,
+            "tables": [
+                {
+                    "database_type": "duckdb",
+                    "database": "other",
+                    "schema": "main",
+                    "table": "users",
+                }
+            ],
+        },
+    }
+
+    denied = client.post("/execute_sql", json=request)
+    assert denied.status_code == 400
+    assert "main.users" in denied.json()["detail"]
+
+    request["table_access"]["tables"][0]["database"] = "test"
+    allowed = client.post("/execute_sql", json=request)
+    assert allowed.status_code == 200
+
+
+@pytest.mark.parametrize("endpoint", ["/execute_sql", "/validate_sql"])
+def test_row_security_filters_active_database_for_execute_and_validate(
+    duckdb_project_with_excluded_columns,
+    endpoint,
+):
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(
+        endpoint,
+        json={
+            "sql": "SELECT id, name FROM users",
+            "insight_project_folder": duckdb_project_with_excluded_columns,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+            "row_security": {
+                "enforced": True,
+                "tables": [
+                    {
+                        "database_type": "duckdb",
+                        "database": "test",
+                        "schema": "main",
+                        "table": "users",
+                        "constraint_columns": ["id"],
+                        "access": "predicate",
+                        "predicate": "id = 1",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    if endpoint == "/execute_sql":
+        assert response.json()["data"] == [{"id": 1, "name": "Alice"}]
+
+
+def test_validate_sql_reuses_guards_without_executing(
+    duckdb_project_with_excluded_columns,
+):
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(
+        "/validate_sql",
+        json={
+            "sql": "SELECT name FROM users",
+            "insight_project_folder": duckdb_project_with_excluded_columns,
+            "table_access": {
+                "enforced": True,
+                "tables": [
+                    {
+                        "database_type": "duckdb",
+                        "database": "test",
+                        "schema": "main",
+                        "table": "users",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"valid": True, "dialect": "duckdb"}
+
+
+@pytest.mark.parametrize("endpoint", ["/execute_sql", "/validate_sql"])
+def test_motherduck_excluded_columns_apply_to_execute_and_validate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    endpoint: str,
+):
+    class MotherDuckDatabaseConfig:
+        name = "motherduck"
+        type = "motherduck"
+        allow_listed_only = False
+        exclude_columns = ["*.email"]
+
+        def get_database_name(self) -> str:
+            return "local"
+
+        def column_matches_pattern(self, schema: str, table: str, column: str) -> bool:
+            return column != "email"
+
+        def execute_sql(self, sql: str):
+            assert sql == "SELECT 1 AS value"
+            return main.pd.DataFrame([{"value": 1}])
+
+    catalog_path = tmp_path / ".meta/databases/type=motherduck/database=local/columns.json"
+    catalog_path.parent.mkdir(parents=True)
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "schemas": {
+                    "main": {
+                        "users": [
+                            {"name": "id", "type": "INTEGER"},
+                            {"name": "email", "type": "VARCHAR"},
+                        ]
+                    }
+                },
+            }
+        )
+    )
+    config = SimpleNamespace(databases=[MotherDuckDatabaseConfig()])
+    monkeypatch.setattr(
+        main.InsightConfig,
+        "try_load",
+        staticmethod(lambda *args, **kwargs: config),
+    )
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+    base_request = {
+        "insight_project_folder": str(tmp_path),
+        "table_access": UNENFORCED_TABLE_ACCESS,
+        "enforce_excluded_columns": True,
+    }
+
+    tableless = client.post(
+        endpoint,
+        json={**base_request, "sql": "SELECT 1 AS value"},
+    )
+    assert tableless.status_code == 200, tableless.text
+
+    guarded = client.post(
+        endpoint,
+        json={**base_request, "sql": "SELECT * FROM users"},
+    )
+    assert guarded.status_code == 400
+    assert "main.users.email" in guarded.json()["detail"]
+
+
+def test_execute_sql_simple_duckdb(duckdb_project_folder):
+    """Test execute_sql endpoint with a DuckDB in-memory database."""
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    response = client.post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT 1 AS id, 'hello' AS message",
+            "insight_project_folder": duckdb_project_folder,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 200
+    assert_sql_result(
+        response.json(),
+        row_count=1,
+        columns=["id", "message"],
+        expected_data=[{"id": 1, "message": "hello"}],
+    )
+
+
+def test_execute_sql_blocks_star_with_excluded_columns(
+    duckdb_project_with_excluded_columns,
+):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    response = client.post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT * FROM users",
+            "insight_project_folder": duckdb_project_with_excluded_columns,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+            "enforce_excluded_columns": True,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Query blocked because SELECT * would include excluded column(s): main.users.email. "
+        "Use SELECT * EXCLUDE (email) to exclude them."
+    )
+
+
+def test_execute_sql_blocks_explicit_excluded_column(
+    duckdb_project_with_excluded_columns,
+):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    response = client.post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT email FROM users",
+            "insight_project_folder": duckdb_project_with_excluded_columns,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+            "enforce_excluded_columns": True,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "main.users.email" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("enforce_excluded_columns", [False, None], ids=["disabled", "omitted"])
+def test_execute_sql_allows_excluded_column_without_enforcement(
+    duckdb_project_with_excluded_columns,
+    enforce_excluded_columns,
+):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+    request = {
+        "sql": "SELECT email FROM users",
+        "insight_project_folder": duckdb_project_with_excluded_columns,
+        "table_access": UNENFORCED_TABLE_ACCESS,
+    }
+    if enforce_excluded_columns is not None:
+        request["enforce_excluded_columns"] = enforce_excluded_columns
+
+    response = client.post("/execute_sql", json=request)
+
+    assert response.status_code == 200
+    assert_sql_result(
+        response.json(),
+        row_count=1,
+        columns=["email"],
+        expected_data=[{"email": "alice@example.com"}],
+    )
+
+
+def test_execute_sql_allows_table_present_in_synced_context(
+    duckdb_project_with_listed_tables_only,
+):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    response = client.post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT * FROM orders",
+            "insight_project_folder": duckdb_project_with_listed_tables_only,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 200
+    assert_sql_result(
+        response.json(),
+        row_count=1,
+        columns=["id", "total"],
+        expected_data=[{"id": 1, "total": 25}],
+    )
+
+
+def test_execute_sql_blocks_table_missing_from_synced_context(
+    duckdb_project_with_listed_tables_only,
+):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    response = client.post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT * FROM users",
+            "insight_project_folder": duckdb_project_with_listed_tables_only,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "allow_listed_only is enabled" in detail
+    assert "Unlisted table(s): main.users" in detail
+    assert "Only synced context tables are allowed - list/read context to see them." in detail
+
+
+def test_azure_entra_tableless_query_does_not_require_sync_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class AzureDatabaseConfig:
+        name = "test-redshift"
+        type = "redshift"
+        auth_mode = SimpleNamespace(value="azure_entra_id")
+        user = None
+        password = None
+        allow_listed_only = True
+        exclude_columns = ["*.secret"]
+
+        def get_database_name(self) -> str:
+            return "analytics"
+
+        def execute_sql_with_token(self, sql: str, access_token: str):
+            assert sql == "SELECT 1 AS value"
+            assert access_token == "token"
+            return main.pd.DataFrame([{"value": 1}])
+
+    config = SimpleNamespace(databases=[AzureDatabaseConfig()])
+    monkeypatch.setattr(
+        main.InsightConfig,
+        "try_load",
+        staticmethod(lambda *args, **kwargs: config),
+    )
+
+    response = TestClient(app, headers=INTERNAL_HEADERS).post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT 1 AS value",
+            "insight_project_folder": "/unused",
+            "table_access": UNENFORCED_TABLE_ACCESS,
+            "azure_access_token": "token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert_sql_result(
+        response.json(),
+        row_count=1,
+        columns=["value"],
+        expected_data=[{"value": 1}],
+    )
+
+
+def test_execute_sql_with_cte_duckdb(duckdb_project_folder):
+    """Test execute_sql endpoint with a DuckDB in-memory database."""
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    response = client.post(
+        "/execute_sql",
+        json={
+            "sql": "WITH test AS (SELECT 1 AS id, 'hello' AS message) SELECT * FROM test",
+            "insight_project_folder": duckdb_project_folder,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 200
+    assert_sql_result(
+        response.json(),
+        row_count=1,
+        columns=["id", "message"],
+        expected_data=[{"id": 1, "message": "hello"}],
+    )
+
+
+# BigQuery tests (requires SSO authentication)
+
+
+@pytest.fixture
+def bigquery_project_folder():
+    """Create a temporary project folder with a BigQuery config using SSO."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config = {
+            "project_name": "test-project",
+            "databases": [
+                {
+                    "name": "insight-bigquery",
+                    "type": "bigquery",
+                    "project_id": "insight-corp",
+                    "sso": True,
+                }
+            ],
+        }
+        config_path = Path(tmpdir) / "insight_config.yaml"
+        with config_path.open("w") as f:
+            yaml.dump(config, f)
+        yield tmpdir
+
+
+def test_execute_sql_simple_bigquery(bigquery_project_folder):
+    """Test execute_sql endpoint with BigQuery using SSO."""
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    response = client.post(
+        "/execute_sql",
+        json={
+            "sql": "SELECT 1 AS id, 'hello' AS message",
+            "insight_project_folder": bigquery_project_folder,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert_sql_result(
+        response.json(),
+        row_count=1,
+        columns=["id", "message"],
+        expected_data=[{"id": 1, "message": "hello"}],
+    )
+
+
+def test_execute_sql_with_cte_bigquery(bigquery_project_folder):
+    """Test execute_sql endpoint with a CTE query on BigQuery."""
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    cte_sql = """
+    WITH users AS (
+        SELECT 1 AS id, 'Alice' AS name
+        UNION ALL SELECT 2, 'Bob'
+        UNION ALL SELECT 3, 'Charlie'
+    )
+    SELECT * FROM users
+    """
+
+    response = client.post(
+        "/execute_sql",
+        json={
+            "sql": cte_sql,
+            "insight_project_folder": bigquery_project_folder,
+            "table_access": UNENFORCED_TABLE_ACCESS,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert_sql_result(
+        response.json(),
+        row_count=3,
+        columns=["id", "name"],
+        expected_data=[
+            {"id": 1, "name": "Alice"},
+            {"id": 2, "name": "Bob"},
+            {"id": 3, "name": "Charlie"},
+        ],
+    )
+
+
+SEMANTIC_MANIFEST_FIXTURE = (
+    Path(__file__).resolve().parent.parent.parent.parent
+    / "cli"
+    / "tests"
+    / "insight_core"
+    / "semantic_layer"
+    / "semantic_manifest.json"
+)
+
+
+@pytest.fixture
+def semantic_layer_project_folder():
+    """A DuckDB project with a MetricFlow semantic layer synced under semantics/."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        project = Path(tmpdir)
+        manifest = project / ".meta" / "semantic_layer" / "semantic_manifest.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(SEMANTIC_MANIFEST_FIXTURE.read_text())
+        config = {
+            "project_name": "test-project",
+            "databases": [
+                {"name": "warehouse", "type": "duckdb", "path": ":memory:"},
+                {"name": "other", "type": "duckdb", "path": ":memory:"},
+            ],
+            "semantic_layer": {
+                "type": "metricflow",
+                "manifest_path": "dbt/target/semantic_manifest.json",
+                "database": "warehouse",
+            },
+        }
+        with (project / "insight_config.yaml").open("w") as f:
+            yaml.dump(config, f)
+        yield tmpdir
+
+
+def test_compile_semantic_query(semantic_layer_project_folder):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    response = client.post(
+        "/semantic_layer/compile",
+        json={
+            "insight_project_folder": semantic_layer_project_folder,
+            "metrics": ["revenue"],
+            "group_by": ["metric_time__month", "order__status"],
+            "where": ["{{ Dimension('order__status') }} = 'completed'"],
+            "order_by": ["-metric_time__month"],
+            "limit": 6,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["database_id"] == "warehouse"
+    assert body["dialect"] == "duckdb"
+    assert "SUM(revenue) AS revenue" in body["sql"]
+    assert "FROM main.orders" in body["sql"]
+    assert "order__status = 'completed'" in body["sql"]
+    assert "LIMIT 6" in body["sql"]
+
+
+def test_compile_semantic_query_reports_unknown_metric(semantic_layer_project_folder):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    response = client.post(
+        "/semantic_layer/compile",
+        json={"insight_project_folder": semantic_layer_project_folder, "metrics": ["revenu"]},
+    )
+
+    assert response.status_code == 400
+    assert "revenue" in response.json()["detail"]
+
+
+def test_compile_semantic_query_without_semantic_layer(duckdb_project_folder):
+    client = TestClient(app, headers=INTERNAL_HEADERS)
+
+    response = client.post(
+        "/semantic_layer/compile",
+        json={"insight_project_folder": duckdb_project_folder, "metrics": ["revenue"]},
+    )
+
+    assert response.status_code == 400
+    assert "semantic_layer" in response.json()["detail"]

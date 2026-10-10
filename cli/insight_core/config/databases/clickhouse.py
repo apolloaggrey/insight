@@ -1,0 +1,1006 @@
+from __future__ import annotations
+
+import fnmatch
+import functools
+import logging
+import re
+import threading
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Literal
+
+from pydantic import Field
+
+from insight_core.config.exceptions import InitError
+from insight_core.ui import ask_text
+
+if TYPE_CHECKING:
+    from ibis import BaseBackend
+
+from .base import DatabaseAccessor, DatabaseConfig
+from .context import DatabaseContext
+
+logger = logging.getLogger(__name__)
+
+# Stream-like engines (Kafka, RabbitMQ, FileLog) disallow direct SELECT by default (code 620)
+_DIRECT_SELECT_DISALLOWED = ("620", "Direct select is not allowed", "stream_like_engine_allow_direct_select")
+
+
+def _is_direct_select_disallowed(exc: BaseException) -> bool:
+    """True if the exception is ClickHouse code 620 / direct select not allowed (e.g. Kafka/RabbitMQ/FileLog)."""
+    msg = str(exc)
+    return any(s in msg for s in _DIRECT_SELECT_DISALLOWED)
+
+
+# Tinybird serves the system database to ADMIN tokens only, so a token scoped to a few tables
+# cannot read system.settings (read while the client is constructed), system.databases or
+# system.tables (discovery). The remaining system reads already fail soft.
+_SERVER_SETTINGS_PROBE_PATTERN = re.compile(
+    r"^\s*select\s+name\s*,\s*value\s*,.*\breadonly\b.*\bfrom\s+system\.settings\b.*\blimit\s+10000\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_SERVER_SETTINGS_PROBE_LOCK = threading.Lock()
+
+
+def _is_server_settings_probe(sql: Any) -> bool:
+    return isinstance(sql, str) and bool(_SERVER_SETTINGS_PROBE_PATTERN.match(sql))
+
+
+def _brief_reason(error: Exception) -> str:
+    """First sentence of an error, so a repeated fallback does not log a paragraph each time."""
+    first = str(error).strip().split(". ", 1)[0]
+    return first if len(first) <= 160 else f"{first[:160]}…"
+
+
+class _NoServerSettings:
+    """Empty stand-in for the server settings probe result."""
+
+    def named_results(self) -> tuple:
+        return ()
+
+
+@contextmanager
+def _server_settings_probe_optional():
+    """Let the connection survive a server that refuses to serve system.settings.
+
+    The probe only feeds client-side setting validation, and an empty result is already a
+    supported state — Tinybird returns no rows even for an ADMIN token — so a refused probe
+    degrades to that instead of failing the connection. Servers that do serve the table are
+    unaffected: the fallback is reached only when the probe itself errors.
+
+    clickhouse-connect builds the client and runs the probe inside ``__init__``, so there is no
+    client to configure beforehand; the query method is wrapped for the length of the connection
+    instead. The lock keeps concurrent connections from restoring each other's wrapper.
+    """
+    from clickhouse_connect.driver.httpclient import HttpClient
+
+    with _SERVER_SETTINGS_PROBE_LOCK:
+        original_query = HttpClient.query
+
+        @functools.wraps(original_query)
+        def query(self, *args, **kwargs):
+            try:
+                return original_query(self, *args, **kwargs)
+            except Exception as e:
+                sql = args[0] if args else kwargs.get("query")
+                if not _is_server_settings_probe(sql):
+                    raise
+                logger.warning(
+                    "system.settings is not readable, connecting without client-side setting validation: %s",
+                    _brief_reason(e),
+                )
+                logger.debug("Full error reading system.settings", exc_info=True)
+                return _NoServerSettings()
+
+        setattr(HttpClient, "query", query)
+        try:
+            yield
+        finally:
+            setattr(HttpClient, "query", original_query)
+
+
+class _RestrictedDiscoveryBackend:
+    """Ibis backend wrapper for credentials that cannot read the system database.
+
+    Schema and table discovery normally comes from system.databases and system.tables. When a
+    least-privilege token cannot read those, discovery falls back to the tables named outright in
+    ``include``, so Insight reads exactly what it was pointed at and nothing more. Everything else is
+    delegated untouched.
+    """
+
+    def __init__(self, backend: BaseBackend, targets: dict[str, list[str]], unexpandable: list[str] | None = None):
+        self._backend = backend
+        self._targets = targets
+        self._unexpandable = unexpandable or []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._backend, name)
+
+    def list_databases(self, *args: Any, **kwargs: Any) -> list[str]:
+        list_databases = getattr(self._backend, "list_databases", None)
+        if list_databases is None:
+            self._warn_unexpandable()
+            return list(self._targets)
+        try:
+            return list_databases(*args, **kwargs)
+        except Exception as e:
+            logger.warning("Cannot list databases (%s); using the schemas named in include", _brief_reason(e))
+            logger.debug("Full error listing databases", exc_info=True)
+            self._warn_unexpandable()
+            return list(self._targets)
+
+    def list_tables(self, *args: Any, database: str | None = None, **kwargs: Any) -> list[str]:
+        try:
+            return self._backend.list_tables(*args, database=database, **kwargs)
+        except Exception as e:
+            logger.warning(
+                "Cannot list tables in %s (%s); using the tables named in include", database, _brief_reason(e)
+            )
+            logger.debug("Full error listing tables in %s", database, exc_info=True)
+            self._warn_unexpandable()
+            return list(self._targets.get(database or "", []))
+
+    def _warn_unexpandable(self) -> None:
+        """Name the include patterns being dropped, so an all-wildcard include is not silent."""
+        if not self._unexpandable:
+            return
+        logger.warning(
+            "Ignoring include patterns that need a table listing to expand: %s. "
+            "Name these tables individually to sync them.",
+            ", ".join(self._unexpandable),
+        )
+        self._unexpandable = []
+
+
+# AggregateFunction(type_str) -> first argument is the function name (uniq, sum, etc.)
+_AGGREGATE_FUNCTION_PATTERN = re.compile(
+    r"aggregatefunction\s*\(\s*(\w+)",
+    re.IGNORECASE,
+)
+
+
+def _aggregate_function_name(dtype: Any) -> str | None:
+    """If dtype is AggregateFunction(...), return the function name (e.g. uniq); else None."""
+    type_str = str(dtype)
+    m = _AGGREGATE_FUNCTION_PATTERN.search(type_str.lower())
+    return m.group(1).lower() if m else None
+
+
+def _normalize_row(row_dict: dict[str, Any]) -> dict[str, Any]:
+    """Coerce non-JSON-serializable values to string for preview output."""
+    out = dict(row_dict)
+    for key, val in out.items():
+        if val is not None and not isinstance(val, (str, int, float, bool, list, dict)):
+            out[key] = str(val)
+    return out
+
+
+def _show_create(conn: BaseBackend, sql: str) -> str | None:
+    """Execute a SHOW CREATE query and return the DDL string, or None on error."""
+    try:
+        cursor = conn.raw_sql(sql)  # type: ignore[union-attr]
+        if hasattr(cursor, "fetchone"):
+            row = cursor.fetchone()
+        elif hasattr(cursor, "result_rows") and hasattr(cursor, "column_names"):
+            rows = getattr(cursor, "result_rows", [])
+            if not rows:
+                return None
+            row = rows[0]
+        else:
+            return None
+        if row is not None and len(row) > 0:
+            return str(row[0]).strip()
+    except Exception:
+        return None
+    return None
+
+
+def _show_create_table(conn: BaseBackend, database: str, table_name: str) -> str | None:
+    """Execute a SHOW CREATE TABLE query and return the DDL string, or None on error."""
+    return _show_create(conn, f"SHOW CREATE TABLE `{database}`.`{table_name}`")
+
+
+def _show_create_dictionary(conn: BaseBackend, database: str, table_name: str) -> str | None:
+    """Execute a SHOW CREATE DICTIONARY query and return the DDL string, or None on error."""
+    return _show_create(conn, f"SHOW CREATE DICTIONARY `{database}`.`{table_name}`")
+
+
+def _is_dictionary(conn: BaseBackend, database: str, table_name: str) -> bool:
+    """Return True if the object is a dictionary.
+
+    Dictionaries created via DDL are registered in system.dictionaries, not system.tables.
+    """
+    try:
+        d = database.replace("\\", "\\\\").replace("'", "''")
+        t = table_name.replace("\\", "\\\\").replace("'", "''")
+        sql = f"SELECT 1 FROM system.dictionaries WHERE database = '{d}' AND name = '{t}' LIMIT 1"
+        cursor = conn.raw_sql(sql)  # type: ignore[union-attr]
+        rows = _raw_sql_to_rows(cursor)
+        return bool(rows)
+    except Exception:
+        return False
+
+
+def _format_key_expr(expr: Any) -> str | None:
+    """Normalize ClickHouse key expressions from system tables."""
+    if expr is None:
+        return None
+    text = str(expr).strip()
+    return text or None
+
+
+def _table_indexes_from_system(conn: BaseBackend, database: str, table_name: str) -> str | None:
+    """Build concise index/storage metadata from system tables/projections/indices."""
+    try:
+        d = database.replace("\\", "\\\\").replace("'", "''")
+        t = table_name.replace("\\", "\\\\").replace("'", "''")
+
+        base_sql = f"""
+            SELECT engine, partition_key, primary_key, sorting_key, sampling_key
+            FROM system.tables
+            WHERE database = '{d}' AND name = '{t}'
+            LIMIT 1
+        """
+        base_rows = _raw_sql_to_rows(conn.raw_sql(base_sql))  # type: ignore[union-attr]
+        if not base_rows:
+            return None
+
+        row = base_rows[0]
+        lines = [f"CREATE TABLE `{database}`.`{table_name}`"]
+
+        engine = _format_key_expr(row.get("engine"))
+        if engine:
+            lines.append(f"ENGINE = {engine}")
+
+        partition_key = _format_key_expr(row.get("partition_key"))
+        if partition_key:
+            lines.append(f"PARTITION BY {partition_key}")
+
+        primary_key = _format_key_expr(row.get("primary_key"))
+        if primary_key:
+            lines.append(f"PRIMARY KEY {primary_key}")
+
+        sorting_key = _format_key_expr(row.get("sorting_key"))
+        if sorting_key:
+            lines.append(f"ORDER BY {sorting_key}")
+
+        sampling_key = _format_key_expr(row.get("sampling_key"))
+        if sampling_key:
+            lines.append(f"SAMPLE BY {sampling_key}")
+
+        proj_sql = f"""
+            SELECT name, type, sorting_key
+            FROM system.projections
+            WHERE database = '{d}' AND table = '{t}'
+            ORDER BY name
+        """
+        proj_rows = _raw_sql_to_rows(conn.raw_sql(proj_sql))  # type: ignore[union-attr]
+        if proj_rows:
+            lines.append("PROJECTIONS:")
+            for proj in proj_rows:
+                name = str(proj.get("name", "")).strip()
+                proj_type = str(proj.get("type", "")).strip()
+                p_sort = proj.get("sorting_key")
+                p_sort_str = ", ".join(map(str, p_sort)) if isinstance(p_sort, list) else str(p_sort or "").strip()
+                suffix = f" ORDER BY {p_sort_str}" if p_sort_str else ""
+                type_suffix = f" ({proj_type})" if proj_type else ""
+                lines.append(f"  PROJECTION {name}{type_suffix}{suffix}")
+
+        idx_sql = f"""
+            SELECT name, type_full, expr, granularity
+            FROM system.data_skipping_indices
+            WHERE database = '{d}' AND table = '{t}'
+            ORDER BY name
+        """
+        idx_rows = _raw_sql_to_rows(conn.raw_sql(idx_sql))  # type: ignore[union-attr]
+        if idx_rows:
+            lines.append("DATA SKIPPING INDICES:")
+            for idx in idx_rows:
+                name = str(idx.get("name", "")).strip()
+                idx_type = str(idx.get("type_full", "")).strip()
+                expr = str(idx.get("expr", "")).strip()
+                granularity = idx.get("granularity")
+                granularity_str = f" GRANULARITY {granularity}" if granularity is not None else ""
+                expr_str = f" expr={expr}" if expr else ""
+                lines.append(f"  INDEX {name} {idx_type}{expr_str}{granularity_str}".strip())
+
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
+def _dictionary_indexes_from_system(conn: BaseBackend, database: str, dictionary_name: str) -> str | None:
+    """Build concise dictionary metadata from system.dictionaries.
+
+    Returns None when crucial metadata (source/layout) is unavailable so callers can
+    fall back to SHOW CREATE DICTIONARY.
+    """
+    try:
+        d = database.replace("\\", "\\\\").replace("'", "''")
+        t = dictionary_name.replace("\\", "\\\\").replace("'", "''")
+        sql = f"""
+            SELECT type, source, `key.names`, lifetime_min, lifetime_max
+            FROM system.dictionaries
+            WHERE database = '{d}' AND name = '{t}'
+            LIMIT 1
+        """
+        rows = _raw_sql_to_rows(conn.raw_sql(sql))  # type: ignore[union-attr]
+        if not rows:
+            return None
+
+        row = rows[0]
+        source = str(row.get("source") or "").strip()
+        layout = str(row.get("type") or "").strip()
+
+        # If dictionary failed to load, system metadata often lacks source/layout.
+        # In that case prefer SHOW CREATE fallback which still has DDL metadata.
+        if not source or not layout:
+            return None
+
+        lines = [f"CREATE DICTIONARY `{database}`.`{dictionary_name}`"]
+        key_names = row.get("key.names")
+        if isinstance(key_names, list) and key_names:
+            lines.append(f"PRIMARY KEY {', '.join(map(str, key_names))}")
+        lines.append(f"SOURCE({source})")
+        lines.append(f"LAYOUT({layout})")
+
+        lifetime_min = row.get("lifetime_min")
+        lifetime_max = row.get("lifetime_max")
+        if lifetime_min is not None and lifetime_max is not None:
+            lines.append(f"LIFETIME(MIN {lifetime_min} MAX {lifetime_max})")
+
+        return "\n".join(lines)
+    except Exception:
+        return None
+
+
+def _summarize_table_ddl(ddl: str) -> str:
+    """Return a concise table metadata summary extracted from SHOW CREATE TABLE."""
+
+    def _lines_with_depth(sql: str) -> list[tuple[str, str, int]]:
+        depth = 0
+        out: list[tuple[str, str, int]] = []
+        for raw in sql.splitlines():
+            line = raw.strip().rstrip(",")
+            if not line:
+                continue
+            out.append((line, line.upper(), depth))
+            depth += raw.count("(") - raw.count(")")
+            if depth < 0:
+                depth = 0
+        return out
+
+    lines = _lines_with_depth(ddl)
+    summary: list[str] = []
+
+    # Keep object header line for context (table name).
+    for line, upper, depth in lines:
+        if depth == 0 and upper.startswith("CREATE TABLE"):
+            summary.append(line)
+            break
+
+    for prefix in ("ENGINE =", "PARTITION BY", "PRIMARY KEY", "ORDER BY", "SAMPLE BY", "TTL", "SETTINGS"):
+        for line, upper, depth in lines:
+            if depth == 0 and upper.startswith(prefix):
+                summary.append(line)
+                break
+
+    projections = [line for line, upper, _ in lines if upper.startswith("PROJECTION ")]
+    if projections:
+        summary.append("PROJECTIONS:")
+        summary.extend(f"  {line}" for line in projections)
+
+    # If parsing misses everything (unexpected format), fall back to raw DDL.
+    return "\n".join(summary) if summary else ddl
+
+
+def _summarize_dictionary_ddl(ddl: str) -> str:
+    """Return a concise dictionary metadata summary extracted from SHOW CREATE DICTIONARY."""
+    lines = [line.strip().rstrip(",") for line in ddl.splitlines() if line.strip()]
+    upper_lines = [line.upper() for line in lines]
+    summary: list[str] = []
+
+    for line, upper in zip(lines, upper_lines, strict=False):
+        if upper.startswith("CREATE DICTIONARY"):
+            summary.append(line)
+            break
+
+    for prefix in ("PRIMARY KEY", "SOURCE(", "LIFETIME(", "LAYOUT("):
+        for line, upper in zip(lines, upper_lines, strict=False):
+            if upper.startswith(prefix):
+                summary.append(line)
+                break
+
+    return "\n".join(summary) if summary else ddl
+
+
+def _raw_sql_to_rows(cursor: Any) -> list[dict[str, Any]]:
+    """Convert raw_sql cursor result to list of dicts (column name -> value)."""
+    if hasattr(cursor, "result_rows") and hasattr(cursor, "column_names"):
+        columns = list(cursor.column_names)
+        raw_rows = cursor.result_rows
+        return [dict(zip(columns, row)) for row in raw_rows]
+    if hasattr(cursor, "fetchall") and hasattr(cursor, "description"):
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    return []
+
+
+def _get_table_comment(conn: BaseBackend, database: str, table_name: str) -> str | None:
+    """Return the table comment from system.tables, or None if missing or on error."""
+    try:
+        # Prevent SQL injection by escaping single quotes
+        d = database.replace("\\", "\\\\").replace("'", "''")
+        t = table_name.replace("\\", "\\\\").replace("'", "''")
+        sql = f"SELECT comment FROM system.tables WHERE database = '{d}' AND name = '{t}'"
+        cursor = conn.raw_sql(sql)  # type: ignore[union-attr]
+        rows = _raw_sql_to_rows(cursor)
+        if not rows:
+            return None
+        comment = rows[0].get("comment")
+        if not comment:
+            return None
+        return str(comment).strip() or None
+    except Exception:
+        return None
+
+
+def _columns_from_system(conn: BaseBackend, database: str, table_name: str) -> list[dict[str, Any]] | None:
+    """Return column metadata from system.columns (does not SELECT from the table)."""
+    try:
+        # Escape single quotes for safe SQL (identifiers from config)
+        d = database.replace("\\", "\\\\").replace("'", "''")
+        t = table_name.replace("\\", "\\\\").replace("'", "''")
+        sql = (
+            "SELECT name, type, default_kind, default_expression, comment "
+            f"FROM system.columns WHERE database = '{d}' AND table = '{t}' ORDER BY position"
+        )
+        cursor = conn.raw_sql(sql)  # type: ignore[union-attr]
+        rows = _raw_sql_to_rows(cursor)
+        return [
+            {
+                "name": r["name"],
+                "type": str(r.get("type", "")),
+                "nullable": "Nullable" in str(r.get("type", "")),
+                "description": str(r.get("comment", "")).strip() or None,
+                "default_kind": str(r.get("default_kind", "")).strip() or None,
+                "default_expression": str(r.get("default_expression", "")).strip() or None,
+            }
+            for r in rows
+        ]
+    except Exception:
+        return None
+
+
+def _quote_identifier(name: str) -> str:
+    """Backtick-quote an identifier, doubling any backtick it contains."""
+    escaped = name.replace("`", "``")
+    return f"`{escaped}`"
+
+
+def _columns_from_describe(conn: BaseBackend, database: str, table_name: str) -> list[dict[str, Any]]:
+    """Return column metadata from DESCRIBE TABLE, which needs no system database access."""
+    target = f"{_quote_identifier(database)}.{_quote_identifier(table_name)}"
+    try:
+        cursor = conn.raw_sql(f"DESCRIBE TABLE {target}")  # type: ignore[union-attr]
+        rows = _raw_sql_to_rows(cursor)
+    except Exception:
+        return []
+    return [
+        {
+            "name": r["name"],
+            "type": str(r.get("type", "")),
+            "nullable": "Nullable" in str(r.get("type", "")),
+            "description": str(r.get("comment", "")).strip() or None,
+            # DESCRIBE calls this default_type; system.columns calls it default_kind.
+            "default_kind": str(r.get("default_type", "")).strip() or None,
+            "default_expression": str(r.get("default_expression", "")).strip() or None,
+        }
+        for r in rows
+        if r.get("name")
+    ]
+
+
+def _column_metadata(
+    conn: BaseBackend, database: str, table_name: str, describe_fallback: bool = False
+) -> list[dict[str, Any]] | None:
+    """Return column metadata from system.columns, falling back to DESCRIBE only when allowed."""
+    columns = _columns_from_system(conn, database, table_name)
+    if columns or not describe_fallback:
+        return columns
+    return _columns_from_describe(conn, database, table_name)
+
+
+def _get_table_engine(conn: BaseBackend, database: str, table_name: str) -> str | None:
+    """Return the table engine from system.tables, or None on error."""
+    try:
+        d = database.replace("\\", "\\\\").replace("'", "''")
+        t = table_name.replace("\\", "\\\\").replace("'", "''")
+        sql = f"SELECT engine FROM system.tables WHERE database = '{d}' AND name = '{t}'"
+        cursor = conn.raw_sql(sql)  # type: ignore[union-attr]
+        rows = _raw_sql_to_rows(cursor)
+        if not rows:
+            return None
+        engine = rows[0].get("engine")
+        if not engine:
+            return None
+        return str(engine).strip() or None
+    except Exception:
+        return None
+
+
+class ClickHouseDatabaseContext(DatabaseContext):
+    """ClickHouse context that uses SHOW CREATE TABLE and schema to know how to query.
+
+    We use the table definition (from schema, which reflects SHOW CREATE TABLE)
+    to build the right SELECT: plain columns as-is, AggregateFunction columns
+    via -Merge (e.g. uniqMerge(column)) so preview works for all table types.
+
+    Stream-like engines (Kafka, RabbitMQ, FileLog) disallow direct SELECT (code 620).
+    When we detect that error for a table, we set _direct_select_disallowed and automatically
+    use the no-SELECT path (SHOW CREATE TABLE + system.columns) for all later operations on that table.
+    """
+
+    def __init__(self, conn: BaseBackend, schema: str, table_name: str, describe_fallback: bool = False):
+        super().__init__(conn, schema, table_name)
+        self._direct_select_disallowed: bool = False
+        self._is_dictionary_obj: bool | None = None
+        self._describe_fallback = describe_fallback
+
+    def _column_metadata(self) -> list[dict[str, Any]] | None:
+        return _column_metadata(self._conn, self._schema, self._table_name, self._describe_fallback)
+
+    @staticmethod
+    def _format_type(dtype: Any) -> str:
+        raw = str(dtype)
+        return raw[1:] + " NOT NULL" if raw.startswith("!") else raw
+
+    @property
+    def is_dictionary(self) -> bool:
+        if self._is_dictionary_obj is None:
+            self._is_dictionary_obj = _is_dictionary(self._conn, self._schema, self._table_name)
+        return self._is_dictionary_obj
+
+    def description(self) -> str | None:
+        return _get_table_comment(self._conn, self._schema, self._table_name)
+
+    def indexes(self) -> str | None:
+        """Return concise index/storage metadata, preferring system tables over DDL parsing."""
+        if self.is_dictionary:
+            system_summary = _dictionary_indexes_from_system(self._conn, self._schema, self._table_name)
+            if system_summary:
+                return system_summary
+            ddl = _show_create_dictionary(self._conn, self._schema, self._table_name)
+            return _summarize_dictionary_ddl(ddl) if ddl else None
+        system_summary = _table_indexes_from_system(self._conn, self._schema, self._table_name)
+        if system_summary:
+            return system_summary
+        ddl = _show_create_table(self._conn, self._schema, self._table_name)
+        return _summarize_table_ddl(ddl) if ddl else None
+
+    def row_count(self) -> int:
+        """Return row count; for stream-like engines (Kafka/RabbitMQ/FileLog) direct SELECT is disallowed, return 0."""
+        if self.is_dictionary:
+            # Dictionary reads can fail when SOURCE credentials differ from sync credentials.
+            # Try a normal count first, then degrade gracefully.
+            try:
+                return self.table.count().execute()
+            except Exception as e:
+                logger.debug(
+                    "ClickHouse dictionary row_count failed for %s.%s: %s; returning 0",
+                    self._schema,
+                    self._table_name,
+                    e,
+                )
+                return 0
+        if self._direct_select_disallowed:
+            return 0
+        try:
+            return self.table.count().execute()
+        except Exception as e:
+            if _is_direct_select_disallowed(e):
+                self._direct_select_disallowed = True
+                logger.debug(
+                    "ClickHouse: direct select not allowed for %s.%s; using no-SELECT path for this table",
+                    self._schema,
+                    self._table_name,
+                )
+                return 0
+            raise
+
+    def column_count(self) -> int:
+        """Return column count; for stream-like engines use system.columns if table.schema() is disallowed."""
+        if self._direct_select_disallowed:
+            return len(self._column_metadata() or [])
+        try:
+            return len(self.table.schema())
+        except Exception:
+            return len(self._column_metadata() or [])
+
+    def columns(self) -> list[dict[str, Any]]:
+        """Return column metadata; for stream-like engines use system.columns (no SELECT from table)."""
+        if self._columns_cache is None:
+            self._columns_load_failed = False
+            columns = self._load_columns()
+            if columns is None:
+                self._columns_load_failed = True
+                return []
+            self._columns_cache = columns
+        return self._filter_excluded_columns(self._columns_cache)
+
+    def _load_columns(self) -> list[dict[str, Any]] | None:
+        if self._direct_select_disallowed:
+            return self._column_metadata()
+        try:
+            schema = self.table.schema()
+            columns = [
+                {
+                    "name": name,
+                    "type": self._format_type(dtype),
+                    "nullable": getattr(dtype, "nullable", True),
+                    "description": None,
+                }
+                for name, dtype in schema.items()
+            ]
+            self._apply_system_column_metadata(columns)
+            return columns
+        except Exception:
+            return self._column_metadata()
+
+    def _apply_system_column_metadata(self, columns: list[dict[str, Any]]) -> None:
+        system_columns = self._column_metadata() or []
+        system_types = {
+            col["name"]: col["type"]
+            for col in system_columns
+            if isinstance(col.get("name"), str) and isinstance(col.get("type"), str) and col["type"]
+        }
+        defaults = {
+            col["name"]: {
+                "default_kind": col.get("default_kind"),
+                "default_expression": col.get("default_expression"),
+            }
+            for col in system_columns
+            if isinstance(col.get("name"), str)
+        }
+        descriptions = {
+            col["name"]: col.get("description") for col in system_columns if isinstance(col.get("name"), str)
+        }
+        for column in columns:
+            name = column.get("name")
+            if not isinstance(name, str):
+                continue
+            if native_type := system_types.get(name):
+                if column.get("nullable") is False and "Nullable(" not in native_type:
+                    column["type"] = f"{native_type} NOT NULL"
+                else:
+                    column["type"] = native_type
+            if metadata := defaults.get(name):
+                column.update(metadata)
+            if description := descriptions.get(name):
+                column["description"] = description
+
+    def _fetchone(self, result) -> tuple | None:
+        """Normalise clickhouse-connect QueryResult objects for profiling queries."""
+        if hasattr(result, "result_rows"):
+            rows = result.result_rows
+            return tuple(rows[0]) if rows else None
+        return super()._fetchone(result)
+
+    def _fetchall(self, result) -> list[tuple]:
+        """Normalise clickhouse-connect QueryResult objects for top-values queries."""
+        if hasattr(result, "result_rows"):
+            return [tuple(row) for row in result.result_rows]
+        return super()._fetchall(result)
+
+    def preview(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Return preview rows by building SELECT from table definition.
+
+        Uses the table schema (same info as SHOW CREATE TABLE) to figure out
+        how to query. For stream-like engines (Kafka/RabbitMQ/FileLog) we
+        automatically use the no-SELECT path (DDL only) once 620 is detected.
+        """
+        if self._direct_select_disallowed:
+            return []
+
+        # Aggregating engines can require FINAL or custom aggregation and can be
+        # expensive to query for preview. Skip preview entirely for them.
+        try:
+            engine = _get_table_engine(self._conn, self._schema, self._table_name)
+            if engine and "aggregatingmergetree" in engine.lower():
+                logger.debug(
+                    "ClickHouse preview skipped for AggregatingMergeTree engine on %s.%s",
+                    self._schema,
+                    self._table_name,
+                )
+                return []
+        except Exception:
+            pass
+
+        schema = self.table.schema()
+
+        # For tables defined with AggregateFunction columns, preview queries can be
+        # both expensive and tricky to express correctly. In this case we skip the
+        # preview entirely and return an empty list.
+        if any(_aggregate_function_name(dtype) for dtype in schema.values()):
+            logger.debug(
+                "ClickHouse preview skipped for AggregateFunction table %s.%s",
+                self._schema,
+                self._table_name,
+            )
+            return []
+
+        # AggregateFunction tables are skipped above; plain column selection is sufficient here.
+        select_parts = [f"`{name}`" for name in schema]
+        quoted_table = f"`{self._schema}`.`{self._table_name}`"
+        sql = f"SELECT {', '.join(select_parts)} FROM {quoted_table} LIMIT {limit}"
+
+        try:
+            cursor = self._conn.raw_sql(sql)  # type: ignore[union-attr]
+            rows = _raw_sql_to_rows(cursor)
+            return [self._filter_excluded_row(_normalize_row(r)) for r in rows]
+        except Exception as e:
+            logger.debug(
+                "ClickHouse preview query failed for %s.%s: %s; returning empty list",
+                self._schema,
+                self._table_name,
+                e,
+            )
+            return []
+
+    def _array_unnest_join(self, table_sql: str, col_sql: str, alias: str) -> str:
+        return f"{table_sql} ARRAY JOIN {col_sql} AS {alias}"
+
+    def _cast_complex_to_string(self, col_sql: str) -> str:
+        return f"toString({col_sql})"
+
+
+class ClickHouseConfig(DatabaseConfig):
+    """ClickHouse-specific configuration."""
+
+    type: Literal["clickhouse"] = "clickhouse"
+    host: str = Field(description="ClickHouse server host")
+    protocol: Literal["http", "native"] = Field(
+        default="http",
+        description=(
+            "Wire protocol to use: 'http' (default, port 8123/8443 via clickhouse-connect/Ibis) "
+            "or 'native' (TCP, port 9000/9440 via clickhouse-driver). Use 'native' for ClickHouse "
+            "instances that do not expose the HTTP interface."
+        ),
+    )
+    port: int | None = Field(
+        default=None,
+        description=(
+            "Server port. Defaults to 8123 (HTTP) / 8443 (HTTPS) for protocol='http' and "
+            "9000 (TCP) / 9440 (TCP+TLS) for protocol='native'."
+        ),
+    )
+    database: str = Field(description="Database name")
+    user: str = Field(description="Username")
+    password: str = Field(default="", description="Password")
+    secure: bool = Field(
+        default=False, description="Use HTTPS for protocol='http' or TLS over TCP for protocol='native'"
+    )
+    connect_timeout: int | None = Field(
+        default=None,
+        description="Connection timeout in seconds (passed to the underlying ClickHouse client).",
+    )
+    send_receive_timeout: int | None = Field(
+        default=None,
+        description="Send/receive timeout in seconds (passed to the underlying ClickHouse client).",
+    )
+    verify: bool = Field(
+        default=True,
+        description="Verify TLS certificates when using protocol='native' with secure=True.",
+    )
+    tolerate_unreadable_system_tables: bool = Field(
+        default=False,
+        description=(
+            "Work with a credential that cannot read the system database. Needed for Tinybird, "
+            "which serves system tables to ADMIN tokens only, so a token scoped to a few tables "
+            "cannot connect at all. Connection tolerates an unreadable system.settings, and "
+            "schema/table discovery falls back to the tables named outright in `include` — "
+            "wildcard patterns cannot be expanded without a table listing, so list each table. "
+            "Query settings are then validated by the server rather than by the client."
+        ),
+    )
+    # System databases are skipped by default unless explicitly included.
+    _SYSTEM_DATABASES = frozenset(("INFORMATION_SCHEMA", "information_schema", "system"))
+    accessors: list[DatabaseAccessor] = Field(
+        default_factory=lambda: list(DatabaseAccessor),
+        description="Which default templates to render per table. Defaults to all.",
+    )
+
+    @classmethod
+    def promptConfig(cls) -> "ClickHouseConfig":
+        """Interactively prompt the user for ClickHouse configuration."""
+        name = ask_text("Connection name:", default="clickhouse-prod") or "clickhouse-prod"
+        host = ask_text("Host:", default="localhost") or "localhost"
+        protocol_str = ask_text(
+            "Protocol (http / native):",
+            default="http",
+        )
+        protocol = (protocol_str or "http").strip().lower()
+        if protocol not in ("http", "native"):
+            raise InitError("Protocol must be 'http' or 'native'.")
+
+        default_port = "8123" if protocol == "http" else "9000"
+        secure_port = "8443" if protocol == "http" else "9440"
+        port_str = ask_text(
+            f"Port (empty = default {default_port}, or {secure_port} when secure):",
+            default="",
+        )
+        if port_str and not port_str.isdigit():
+            raise InitError("Port must be a valid integer or empty.")
+        port = int(port_str) if port_str and port_str.isdigit() else None
+        database = ask_text("Database name:", default="default") or "default"
+        user = ask_text("Username:", default="default") or "default"
+        password = ask_text("Password:", password=True) or ""
+        secure_prompt = "Use HTTPS (y/n):" if protocol == "http" else "Use TLS (y/n):"
+        secure_str = ask_text(secure_prompt, default="n")
+        secure = bool(secure_str and str(secure_str).lower().startswith("y"))
+        if port is None:
+            if protocol == "http":
+                port = 8443 if secure else 8123
+            else:
+                port = 9440 if secure else 9000
+
+        return ClickHouseConfig(
+            name=name,
+            host=host,
+            protocol=protocol,  # type: ignore[arg-type]
+            port=port,
+            database=database,
+            user=user,
+            password=password,
+            secure=secure,
+        )
+
+    def connect(self) -> BaseBackend:
+        """Create a ClickHouse connection.
+
+        ``protocol='http'`` returns an ``ibis`` HTTP backend (via clickhouse-connect).
+        ``protocol='native'`` returns an Ibis-compatible shim backed by
+        ``clickhouse-driver`` so that Insight can talk to ClickHouse instances that
+        only expose the native TCP protocol (port 9000 by default).
+        """
+        backend = self._connect_native() if self.protocol == "native" else self._connect_http()
+        if not self.tolerate_unreadable_system_tables:
+            return backend
+        targets, unexpandable = self._include_targets()
+        return _RestrictedDiscoveryBackend(backend, targets, unexpandable)  # type: ignore[return-value]
+
+    def _include_targets(self) -> tuple[dict[str, list[str]], list[str]]:
+        """Split include into tables named outright and patterns that need a listing to expand."""
+        targets: dict[str, list[str]] = {}
+        unexpandable: list[str] = []
+        for pattern in self.include:
+            schema, separator, table = pattern.partition(".")
+            if any(char in pattern for char in "*?[") or not separator or not table:
+                unexpandable.append(pattern)
+                continue
+            targets.setdefault(schema, []).append(table)
+        return targets, unexpandable
+
+    def _connect_http(self) -> BaseBackend:
+        from insight_core.deps import require_database_backend
+
+        require_database_backend("clickhouse")
+
+        if self.tolerate_unreadable_system_tables:
+            with _server_settings_probe_optional():
+                return self._connect_http_client()
+        # Hold the same lock so a concurrent opt-in connection's process-wide patch cannot
+        # leak into a connection that did not ask for it.
+        with _SERVER_SETTINGS_PROBE_LOCK:
+            return self._connect_http_client()
+
+    def _connect_http_client(self) -> BaseBackend:
+        import ibis
+
+        kwargs: dict = {
+            "host": self.host,
+            "database": self.database,
+            "user": self.user,
+            "password": self.password,
+            "secure": self.secure,
+        }
+        # ibis only uses `secure` to pick the default port; it never forwards it to
+        # clickhouse_connect, so the client falls back to plain HTTP on TLS-only ports.
+        # Force the HTTPS interface explicitly via **kwargs, which ibis does forward.
+        if self.secure:
+            kwargs["interface"] = "https"
+        if self.port is not None:
+            kwargs["port"] = self.port
+        if self.connect_timeout is not None:
+            kwargs["connect_timeout"] = self.connect_timeout
+        if self.send_receive_timeout is not None:
+            kwargs["send_receive_timeout"] = self.send_receive_timeout
+        return ibis.clickhouse.connect(**kwargs)
+
+    def _connect_native(self) -> BaseBackend:
+        from insight_core.deps import require_dependency
+
+        require_dependency(
+            "clickhouse_driver",
+            "clickhouse",
+            purpose="to connect to ClickHouse over the native TCP protocol",
+        )
+
+        from ._clickhouse_native import NativeClickHouseBackend
+
+        return NativeClickHouseBackend(  # type: ignore[return-value]
+            host=self.host,
+            port=self.port,
+            database=self.database,
+            user=self.user,
+            password=self.password,
+            secure=self.secure,
+            connect_timeout=self.connect_timeout,
+            send_receive_timeout=self.send_receive_timeout,
+            verify=self.verify,
+        )
+
+    def get_database_name(self) -> str:
+        """Get the database name for ClickHouse."""
+        return self.database
+
+    def get_schemas(self, conn: BaseBackend) -> list[str]:
+        list_databases = getattr(conn, "list_databases", None)
+        if not list_databases:
+            return []
+
+        # include/exclude are schema.table globs; reduce them to schema globs for pre-filtering.
+        include_schema_patterns = [p.split(".", 1)[0] if "." in p else p for p in self.include]
+        exclude_schema_patterns = [
+            p.split(".", 1)[0] if "." in p else p
+            # Only schema-wide excludes should drop a schema up front.
+            for p in self.exclude
+            if "." not in p or p.endswith(".*")
+        ]
+
+        schemas: list[str] = []
+        for schema in list_databases():
+            # Keep system schemas off by default unless explicitly re-included (e.g. "system.*").
+            if schema in self._SYSTEM_DATABASES and not any(
+                fnmatch.fnmatch(schema, pattern) for pattern in include_schema_patterns
+            ):
+                continue
+            # Apply schema-level excludes before table listing for efficiency.
+            if exclude_schema_patterns and any(fnmatch.fnmatch(schema, pattern) for pattern in exclude_schema_patterns):
+                continue
+            schemas.append(schema)
+
+        return schemas
+
+    def create_context(self, conn: BaseBackend, schema: str, table_name: str) -> ClickHouseDatabaseContext:
+        """Use ClickHouse-specific context for resilient preview."""
+        return ClickHouseDatabaseContext(
+            conn, schema, table_name, describe_fallback=self.tolerate_unreadable_system_tables
+        )
+
+    def _connection_error_message(self, error: Exception) -> str:
+        """Point at the escape hatch when the connection died on a system database read."""
+        message = str(error)
+        if "system." in message and not self.tolerate_unreadable_system_tables:
+            return (
+                f"{message}\n"
+                "This credential cannot read the system database, which the ClickHouse client "
+                "reads when connecting and when discovering tables. Set "
+                "tolerate_unreadable_system_tables: true on this connection and list the tables "
+                "you want in `include`."
+            )
+        return message
+
+    def check_connection(self) -> tuple[bool, str]:
+        """Test connectivity to ClickHouse."""
+        conn = None
+        try:
+            conn = self.connect()
+            if list_databases := getattr(conn, "list_databases", None):
+                schemas = list_databases()
+                return True, f"Connected successfully ({len(schemas)} databases found)"
+            return True, "Connected successfully"
+        except Exception as e:
+            return False, self._connection_error_message(e)
+        finally:
+            if conn is not None:
+                conn.disconnect()

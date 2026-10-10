@@ -1,0 +1,216 @@
+import type { UserRole } from '@insight/shared/types';
+import { initTRPC, TRPCError } from '@trpc/server';
+import type { CreateFastifyContextOptions } from '@trpc/server/adapters/fastify';
+import superjson from 'superjson';
+
+import { getSession } from '../auth';
+import * as orgQueries from '../queries/organization.queries';
+import * as projectQueries from '../queries/project.queries';
+import { isOrganizationRoleMappingActive } from '../services/sso-group-mapping.service';
+import { HandlerError } from '../utils/error';
+import { convertHeaders } from '../utils/utils';
+
+export type Context = Awaited<ReturnType<typeof createContext>>;
+export type MiddlewareFunction = Parameters<typeof t.procedure.use>[0];
+
+export const createContext = async (opts: CreateFastifyContextOptions) => {
+	const headers = convertHeaders(opts.req.headers);
+	const session = await getSession(headers);
+	return {
+		session,
+		selectedProjectId: headers.get('x-insight-project-id'),
+		selectedOrganizationId: headers.get('x-insight-organization-id'),
+	};
+};
+
+/**
+ * Initialization of tRPC backend
+ * Should be done only once per backend!
+ */
+const t = initTRPC.context<Context>().create({
+	transformer: superjson,
+	errorFormatter({ shape, error }) {
+		const cause = error.cause as (Error & Record<string, unknown>) | undefined;
+		const conflictingProjectName =
+			typeof cause?.conflictingProjectName === 'string' ? cause.conflictingProjectName : undefined;
+		return {
+			...shape,
+			data: {
+				...shape.data,
+				...(conflictingProjectName ? { conflictingProjectName } : {}),
+			},
+		};
+	},
+});
+
+export const router = t.router;
+
+// Map HandlerError to tRPC error
+const withHandlerErrors = t.middleware(async ({ next }) => {
+	try {
+		return await next();
+	} catch (error) {
+		if (error instanceof HandlerError) {
+			throw new TRPCError({ code: error.codeMessage, message: error.message });
+		}
+		throw error;
+	}
+});
+
+export const publicProcedure = t.procedure.use(withHandlerErrors);
+
+export const protectedProcedure = publicProcedure.use(async ({ ctx, next }) => {
+	if (!ctx.session?.user) {
+		throw new TRPCError({ code: 'UNAUTHORIZED' });
+	}
+
+	return next({ ctx: { user: ctx.session.user } });
+});
+
+export async function resolveOrganizationMembership(
+	userId: string,
+	selectedProjectId: string | null,
+	selectedOrganizationId?: string | null,
+) {
+	if (selectedOrganizationId) {
+		const membership = await orgQueries.getUserOrgMembership(userId, selectedOrganizationId);
+		if (!membership) {
+			throw new TRPCError({ code: 'NOT_FOUND', message: 'You are not a member of any organization' });
+		}
+		return membership;
+	}
+
+	if (selectedProjectId) {
+		const membership = await orgQueries.getUserOrgMembershipByProject(userId, selectedProjectId);
+		if (!membership) {
+			throw new TRPCError({ code: 'NOT_FOUND', message: 'Selected project organization was not found' });
+		}
+		return membership;
+	}
+
+	const membership = await orgQueries.getUserOrgMembership(userId);
+	if (!membership) {
+		throw new TRPCError({ code: 'NOT_FOUND', message: 'You are not a member of any organization' });
+	}
+	return membership;
+}
+
+export const projectProtectedProcedure = protectedProcedure.use(async ({ ctx, next }) => {
+	const project = await projectQueries.getProjectByUserId(ctx.user.id, ctx.selectedProjectId);
+	if (!project) {
+		throw new TRPCError({ code: 'BAD_REQUEST', message: 'No project configured' });
+	}
+	const userRole: UserRole | null = await projectQueries.getUserRoleInProject(project.id, ctx.user.id);
+
+	return next({ ctx: { project, userRole } });
+});
+
+/** Grants project access to admins, users, and context admins. */
+export const nonViewerProtectedProcedure = projectProtectedProcedure.use(async ({ ctx, next }) => {
+	if (ctx.userRole !== 'admin' && ctx.userRole !== 'user' && ctx.userRole !== 'context_admin') {
+		throw new TRPCError({ code: 'FORBIDDEN', message: 'Viewers cannot access this resource' });
+	}
+
+	return next({ ctx });
+});
+
+export const canSendProcedure = projectProtectedProcedure.use(async ({ ctx, next }) => {
+	if (ctx.userRole !== 'admin' && ctx.userRole !== 'user' && ctx.userRole !== 'context_admin') {
+		throw new TRPCError({ code: 'FORBIDDEN', message: 'Viewers cannot perform this action' });
+	}
+
+	return next({ ctx });
+});
+
+export function resourceProjectProcedure<T extends { projectId: string }>(
+	inputField: string,
+	fetch: (id: string) => Promise<T | null>,
+	label: string,
+	checkAccess?: (resource: T, userId: string) => Promise<boolean>,
+) {
+	return protectedProcedure.use(async ({ ctx, getRawInput, next }) => {
+		const rawInput = (await getRawInput()) as Record<string, unknown>;
+		const resourceId = rawInput[inputField];
+		if (typeof resourceId !== 'string') {
+			throw new TRPCError({ code: 'BAD_REQUEST', message: `${inputField} is required.` });
+		}
+
+		const resource = await fetch(resourceId);
+		if (!resource) {
+			throw new TRPCError({ code: 'NOT_FOUND', message: `${label} not found.` });
+		}
+
+		const userRole: UserRole | null = await projectQueries.getUserRoleInProject(resource.projectId, ctx.user.id);
+		if (!userRole) {
+			throw new TRPCError({ code: 'FORBIDDEN', message: 'You do not have access to this project.' });
+		}
+
+		if (checkAccess) {
+			const canAccess = await checkAccess(resource, ctx.user.id);
+			if (!canAccess) {
+				throw new TRPCError({
+					code: 'FORBIDDEN',
+					message: `You do not have access to this ${label.toLowerCase()}.`,
+				});
+			}
+		}
+
+		return next({ ctx: { resource, userRole } });
+	});
+}
+
+export const adminProtectedProcedure = projectProtectedProcedure.use(async ({ ctx, next }) => {
+	if (ctx.userRole !== 'admin') {
+		throw new TRPCError({ code: 'FORBIDDEN', message: 'Only admins can perform this action' });
+	}
+
+	return next({ ctx: { project: ctx.project, userRole: ctx.userRole } });
+});
+
+/**
+ * Grants access to admins and context admins. Context admins use Insight like regular users but
+ * additionally manage observability surfaces: chat replay and context recommendations.
+ */
+export const contextAdminProtectedProcedure = projectProtectedProcedure.use(async ({ ctx, next }) => {
+	if (ctx.userRole !== 'admin' && ctx.userRole !== 'context_admin') {
+		throw new TRPCError({ code: 'FORBIDDEN', message: 'Only admins or context admins can perform this action' });
+	}
+
+	return next({ ctx: { project: ctx.project, userRole: ctx.userRole } });
+});
+
+/** Organization roles mapped from identity provider groups are re-applied on every sign-in. */
+export async function assertOrganizationRolesAreEditable(): Promise<void> {
+	if (await isOrganizationRoleMappingActive()) {
+		throw new TRPCError({
+			code: 'FORBIDDEN',
+			message: 'Organization roles are managed by your identity provider and cannot be changed here.',
+		});
+	}
+}
+
+export function ownedResourceProcedure(
+	getOwnerId: (resourceId: string) => Promise<string | undefined>,
+	resourceName: string,
+) {
+	return protectedProcedure.use(async ({ ctx, getRawInput, next }) => {
+		const rawInput = (await getRawInput()) as Record<string, unknown>;
+		const resourceId = rawInput[`${resourceName}Id`];
+		if (typeof resourceId !== 'string') {
+			throw new TRPCError({ code: 'BAD_REQUEST', message: `${resourceName}Id is required.` });
+		}
+
+		const ownerId = await getOwnerId(resourceId);
+		if (!ownerId) {
+			throw new TRPCError({ code: 'NOT_FOUND', message: `${resourceName} not found.` });
+		}
+		if (ownerId !== ctx.user.id) {
+			throw new TRPCError({
+				code: 'FORBIDDEN',
+				message: `You are not authorized to modify this ${resourceName}.`,
+			});
+		}
+
+		return next({ ctx });
+	});
+}

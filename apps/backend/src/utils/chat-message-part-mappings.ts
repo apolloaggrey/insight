@@ -1,0 +1,193 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { getToolName, isToolUIPart } from 'ai';
+
+import { DBMessagePart, NewMessagePart } from '../db/abstractSchema';
+import { UIMessagePart, UIToolPart } from '../types/chat';
+import { buildImageUrl } from './image';
+import { isStoragePath, toStorageRelativePath, toStorageVirtualPath } from './tools';
+
+const PROVIDER_EXECUTED_TOOLS = new Set(['web_search', 'web_fetch', 'google_search']);
+
+/**
+ * Converts a list of UI message parts to a list of database message parts.
+ */
+export const mapUIPartsToDBParts = (parts: UIMessagePart[], messageId: string): NewMessagePart[] => {
+	return parts
+		.map((part, index) => convertUIPartToDBPart(part, messageId, index))
+		.filter((part) => part !== undefined);
+};
+
+export const convertUIPartToDBPart = (
+	part: UIMessagePart,
+	messageId: string,
+	order: number,
+): NewMessagePart | undefined => {
+	if (isToolUIPart(part)) {
+		return {
+			messageId,
+			order,
+			toolName: getToolName(part),
+			type: part.type,
+			toolCallId: part.toolCallId,
+			toolState: part.state,
+			toolInput: part.input,
+			toolRawInput: (part as any).rawInput,
+			toolOutput: part.output,
+			toolErrorText: part.errorText,
+			toolApprovalApproved: part.approval?.approved,
+			toolApprovalReason: part.approval?.reason,
+			toolApprovalId: part.approval?.id,
+			toolProviderMetadata: part.callProviderMetadata,
+		};
+	}
+
+	switch (part.type) {
+		case 'text':
+			return {
+				messageId,
+				order,
+				type: 'text',
+				text: part.text,
+				providerMetadata: part.providerMetadata,
+			};
+		case 'reasoning':
+			return {
+				messageId,
+				order,
+				type: 'reasoning',
+				reasoningText: part.text,
+				providerMetadata: part.providerMetadata,
+			};
+		case 'file': {
+			const imageId = extractImageIdFromUrl(part.url);
+			const storagePath = imageId ? null : extractStoragePathFromUrl(part.url);
+			if (!imageId && !storagePath) {
+				return undefined;
+			}
+			return {
+				messageId,
+				order,
+				type: 'file',
+				mediaType: part.mediaType,
+				imageId,
+				storagePath,
+				filename: part.filename ?? null,
+			};
+		}
+		case 'step-start':
+			return {
+				type: 'step-start',
+				messageId,
+				order,
+			};
+		case 'data-compaction':
+			return {
+				type: 'data-compaction',
+				text: part.data.summary,
+				toolErrorText: part.data.error,
+				messageId,
+				order,
+			};
+		default:
+			return undefined;
+	}
+};
+
+/**
+ * Converts a list of database message parts to a list of UI message parts.
+ */
+export const mapDBPartsToUIParts = (parts: DBMessagePart[]): UIMessagePart[] => {
+	return parts.map((part) => convertDBPartToUIPart(part)).filter((part) => part !== undefined);
+};
+
+export const convertDBPartToUIPart = (part: DBMessagePart): UIMessagePart | undefined => {
+	if (isToolDBPart(part)) {
+		return convertDBToolPartToUIPart(part);
+	}
+
+	switch (part.type) {
+		case 'text':
+			return {
+				type: 'text',
+				text: part.text!,
+				providerMetadata: part.providerMetadata ?? undefined,
+			};
+		case 'reasoning':
+			return {
+				type: 'reasoning',
+				text: part.reasoningText!,
+				providerMetadata: part.providerMetadata ?? undefined,
+			};
+		case 'file':
+			if (part.imageId) {
+				return {
+					type: 'file',
+					mediaType: part.mediaType!,
+					url: buildImageUrl(part.imageId),
+				};
+			}
+			if (part.storagePath) {
+				return {
+					type: 'file',
+					mediaType: part.mediaType!,
+					filename: part.filename ?? undefined,
+					url: toStorageVirtualPath(part.storagePath),
+				};
+			}
+			return undefined;
+		case 'step-start':
+			return {
+				type: 'step-start',
+			};
+		case 'data-compaction':
+			return {
+				type: 'data-compaction',
+				data: {
+					summary: part.text!,
+					error: part.toolErrorText ?? undefined,
+				},
+			};
+		default:
+			return undefined;
+	}
+};
+
+const isToolDBPart = (part: DBMessagePart): part is DBMessagePart & { type: UIToolPart['type'] } => {
+	return part.type.startsWith('tool-') || part.type === 'dynamic-tool';
+};
+
+const convertDBToolPartToUIPart = (part: DBMessagePart & { type: UIToolPart['type'] }): UIToolPart => {
+	const toolPart = {
+		type: part.type,
+		toolName: part.toolName!,
+		toolCallId: part.toolCallId!,
+		state: part.toolState as any,
+		input: part.toolInput as any,
+		rawInput: part.toolRawInput as any,
+		output: part.toolOutput as any,
+		errorText: part.toolErrorText as any,
+		providerExecuted: PROVIDER_EXECUTED_TOOLS.has(part.toolName!),
+		approval: part.toolApprovalId
+			? {
+					id: part.toolApprovalId!,
+					approved: part.toolApprovalApproved!,
+					reason: part.toolApprovalReason!,
+				}
+			: undefined,
+		callProviderMetadata: part.toolProviderMetadata ?? undefined,
+	};
+
+	return toolPart as UIToolPart;
+};
+
+const IMAGE_URL_PATTERN = /^\/i\/([a-f0-9-]+)$/;
+
+function extractImageIdFromUrl(url: string): string | null {
+	const match = url.match(IMAGE_URL_PATTERN);
+	return match?.[1] ?? null;
+}
+
+/** A file kept in permanent storage carries its virtual `/home/…` path as its URL. */
+function extractStoragePathFromUrl(url: string): string | null {
+	return isStoragePath(url) ? toStorageRelativePath(url) || null : null;
+}

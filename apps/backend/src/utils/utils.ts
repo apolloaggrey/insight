@@ -1,0 +1,248 @@
+import { IncomingHttpHeaders } from 'node:http';
+
+/** Convert fastify headers to basic `Headers` for better-auth. */
+export const convertHeaders = (headers: IncomingHttpHeaders) => {
+	const convertedHeaders = new Headers();
+	for (const [key, value] of Object.entries(headers)) {
+		if (value) {
+			convertedHeaders.set(key, Array.isArray(value) ? value.join(', ') : value);
+		}
+	}
+	return convertedHeaders;
+};
+
+export const isAbortError = (error: unknown): error is Error & { name: 'AbortError' } => {
+	return error instanceof Error && error.name === 'AbortError';
+};
+
+export const getErrorMessage = (error: unknown): string | null => {
+	if (!error) {
+		return null;
+	}
+	if (error instanceof Error) {
+		return error.message;
+	}
+	return String(error);
+};
+
+export const formatErrorMessageForUI = (error: unknown): string => {
+	if (isTypeValidationError(error)) {
+		const payload = error.value;
+		if (isProviderErrorPayload(payload)) {
+			const code = payload.error.code;
+			const requestId = getProviderRequestId(payload);
+			return JSON.stringify({
+				error: {
+					message: `The model provider returned an error${code ? ` (${code})` : ''}. Please retry.`,
+					...(requestId && { requestId }),
+				},
+			});
+		}
+		return 'The model provider returned an error. Please retry.';
+	}
+	const message = error instanceof Error ? error.message.trim() : '';
+	return message || 'An error occurred.';
+};
+
+function isTypeValidationError(error: unknown): error is Error & { value: unknown } {
+	return error instanceof Error && error.name === 'AI_TypeValidationError' && 'value' in error;
+}
+
+function isProviderErrorPayload(
+	value: unknown,
+): value is { error: { message: string; code?: string | number | null } } {
+	if (!value || typeof value !== 'object' || !('error' in value)) {
+		return false;
+	}
+	const nestedError = value.error;
+	return (
+		!!nestedError &&
+		typeof nestedError === 'object' &&
+		'message' in nestedError &&
+		typeof nestedError.message === 'string'
+	);
+}
+
+function getProviderRequestId(payload: { error: { message: string } }): string | undefined {
+	const explicitRequestId =
+		readStringProperty(payload, 'request_id') ??
+		readStringProperty(payload, 'requestId') ??
+		readStringProperty(payload.error, 'request_id') ??
+		readStringProperty(payload.error, 'request ID') ??
+		readStringProperty(payload.error, 'requestId');
+	if (explicitRequestId) {
+		return explicitRequestId;
+	}
+
+	return payload.error.message.match(/\brequest\s+id\s+([a-z0-9][a-z0-9._:-]{5,127})\b/i)?.[1];
+}
+
+function readStringProperty(value: object, property: string): string | undefined {
+	if (!(property in value)) {
+		return undefined;
+	}
+	const result = (value as Record<string, unknown>)[property];
+	return typeof result === 'string' && result.trim() ? result.trim() : undefined;
+}
+
+/** GitHub and GitLab usernames are case-insensitive, so entries are normalized to lowercase. */
+export const buildUsernameAllowlist = (allowedUsers?: string): Set<string> => {
+	const allowed = new Set<string>();
+	if (allowedUsers) {
+		for (const username of allowedUsers.split(',')) {
+			const trimmed = username.trim().toLowerCase();
+			if (trimmed) {
+				allowed.add(trimmed);
+			}
+		}
+	}
+	return allowed;
+};
+
+export const normalizeEmailDomains = (raw: string): string[] => {
+	const seen = new Set<string>();
+	for (const entry of raw.split(',')) {
+		const domain = entry.trim().toLowerCase().replace(/^@/, '');
+		if (domain) {
+			seen.add(domain);
+		}
+	}
+	return [...seen];
+};
+
+export const getEmailDomain = (email: string): string | null => {
+	return email.split('@').at(1)?.trim().toLowerCase() || null;
+};
+
+/**
+ * Free / consumer email providers. These can never be claimed for organization
+ * sign-in routing, since anyone can hold an address on them.
+ */
+const PUBLIC_EMAIL_DOMAINS = new Set<string>([
+	'gmail.com',
+	'googlemail.com',
+	'outlook.com',
+	'hotmail.com',
+	'hotmail.co.uk',
+	'live.com',
+	'msn.com',
+	'yahoo.com',
+	'yahoo.co.uk',
+	'ymail.com',
+	'icloud.com',
+	'me.com',
+	'mac.com',
+	'aol.com',
+	'proton.me',
+	'protonmail.com',
+	'pm.me',
+	'gmx.com',
+	'gmx.net',
+	'gmx.de',
+	'mail.com',
+	'zoho.com',
+	'yandex.com',
+	'yandex.ru',
+	'qq.com',
+	'163.com',
+	'126.com',
+	'fastmail.com',
+	'hey.com',
+]);
+
+export const isPublicEmailDomain = (domain: string): boolean => {
+	return PUBLIC_EMAIL_DOMAINS.has(domain.trim().toLowerCase());
+};
+
+export const isEmailDomainAllowed = (userEmail: string, authDomains?: string) => {
+	if (authDomains) {
+		const allowedDomains = authDomains.split(',').map((domain) => domain.trim().toLowerCase());
+		const userEmailDomain = userEmail.split('@').at(1)?.toLowerCase();
+		if (!userEmailDomain) {
+			return false;
+		}
+		return allowedDomains.includes(userEmailDomain);
+	}
+	return true;
+};
+
+/**
+ * Resolve the auth provider ID from the better-auth callback context.
+ * Social providers use `params.id`, the genericOAuth plugin (OIDC) uses `params.providerId`.
+ */
+export function resolveProviderId(ctx?: { params?: Record<string, string | undefined> } | null): string | undefined {
+	return ctx?.params?.id ?? ctx?.params?.providerId;
+}
+
+export const regexPassword = /^(?=.*?[A-Z])(?=.*?[a-z])(?=.*?[0-9])(?=.*?[#?!@$%^&*-]).{8,}$/;
+
+export const replaceEnvVars = (fileContent: string, extraEnv: Record<string, string> = {}) => {
+	const replaced = fileContent.replace(/\$\{(\w+)\}/g, (match, varName) => {
+		if (Object.hasOwn(extraEnv, varName)) {
+			return extraEnv[varName];
+		}
+		return process.env[varName] || match;
+	});
+	return replaced;
+};
+
+/** Truncate a string to a maximum length and add an ellipsis in the middle. */
+export const truncateMiddle = (str: string, maxLength: number, ellipsis: string = '...'): string => {
+	if (str.length <= maxLength) {
+		return str;
+	}
+	if (maxLength <= ellipsis.length) {
+		return str.slice(0, maxLength);
+	}
+	const half = Math.floor((maxLength - ellipsis.length) / 2);
+	return str.slice(0, half) + ellipsis + str.slice(-half);
+};
+
+export const removeNewLine = (str: string): string => {
+	return str.replace(/[\r\n]/g, '');
+};
+
+export function groupBy<T, K extends string>(
+	items: T[],
+	keyFn: (item: T) => K,
+	filterFn?: (item: T) => boolean,
+): Record<K, T[]> {
+	return items.reduce(
+		(acc, item) => {
+			if (filterFn && !filterFn(item)) {
+				return acc;
+			}
+			const key = keyFn(item);
+			if (!acc[key]) {
+				acc[key] = [];
+			}
+			acc[key].push(item);
+			return acc;
+		},
+		{} as Record<K, T[]>,
+	);
+}
+
+export const previewApiKey = (apiKey: string | null | undefined): string | null =>
+	apiKey ? apiKey.slice(0, 8) + '...' + apiKey.slice(-4) : null;
+
+export const buildCredentialPreviews = (
+	credentials: Record<string, string> | null | undefined,
+): Record<string, string> | null => {
+	if (!credentials) {
+		return null;
+	}
+	return Object.fromEntries(
+		Object.entries(credentials).map(([key, val]) => [key, val ? val.slice(0, 4) + '...' + val.slice(-4) : '']),
+	);
+};
+
+export const formatSize = (bytes: number) => {
+	if (bytes < 1024) {
+		return `${bytes} B`;
+	}
+	if (bytes < 1024 * 1024) {
+		return `${(bytes / 1024).toFixed(1)} KB`;
+	}
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};

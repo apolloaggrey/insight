@@ -1,0 +1,744 @@
+import math
+import os
+import secrets
+import sys
+from contextlib import asynccontextmanager
+from datetime import date, datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Annotated, Any
+
+import numpy as np
+import pandas as pd
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+__all__ = ["BlockedRowAccessTable", "EnforcedRowSecurity", "PredicateRowAccessTable"]
+
+load_dotenv()
+
+fastapi_path = Path(__file__).resolve().parent
+cli_path = fastapi_path.parent.parent.parent / "cli"
+sys.path.insert(0, str(fastapi_path))
+sys.path.insert(0, str(cli_path))
+
+from api_models import (  # noqa: E402
+    BlockedRowAccessTable,
+    EnforcedRowSecurity,
+    ExecuteSQLRequest,
+    ExecuteSQLResponse,
+    HealthResponse,
+    PredicateRowAccessTable,
+    RowSecurity,
+    TableAccess,
+    ValidateRowPredicateRequest,
+    ValidateRowPredicateResponse,
+    ValidateSQLResponse,
+)
+from insight_core.commands.sync.cleanup import get_database_folder_names  # noqa: E402
+from insight_core.config import InsightConfig, InsightConfigError  # noqa: E402
+from insight_core.config.databases.allow_listed_only_guard import (  # noqa: E402
+    AllowListedOnlyGuardError,
+    enforce_allow_listed_only,
+    query_references_base_tables,
+)
+from insight_core.config.databases.column_access import (  # noqa: E402
+    ColumnAccessError,
+    validate_column_access,
+)
+from insight_core.config.databases.row_security_guard import (  # noqa: E402
+    RowSecurityGuardError,
+    RowSecurityPolicy,
+    enforce_row_security,
+    validate_row_security_predicate,
+)
+from insight_core.context import get_context_provider  # noqa: E402
+from insight_core.semantic_layer import (  # noqa: E402
+    MetricFlowSemanticLayer,
+    SemanticLayerError,
+    SemanticLayerUnavailableError,
+    SemanticQuery,
+    metricflow_dialect_for,
+    runtime_manifest_path,
+)
+
+port = int(os.environ.get("PORT", 8005))
+
+# Global scheduler instance
+scheduler = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan - setup scheduler on startup."""
+    global scheduler
+
+    # Setup periodic refresh if configured
+    refresh_schedule = os.environ.get("INSIGHT_REFRESH_SCHEDULE")
+    if refresh_schedule:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.cron import CronTrigger
+
+        scheduler = AsyncIOScheduler()
+
+        try:
+            trigger = CronTrigger.from_crontab(refresh_schedule)
+            scheduler.add_job(
+                _refresh_context_task,
+                trigger,
+                id="context_refresh",
+                name="Periodic context refresh",
+            )
+            scheduler.start()
+            print(f"[Scheduler] Periodic refresh enabled: {refresh_schedule}")
+        except ValueError as e:
+            print(f"[Scheduler] Invalid cron expression '{refresh_schedule}': {e}")
+
+    yield
+
+    # Shutdown scheduler
+    if scheduler:
+        scheduler.shutdown(wait=False)
+
+
+async def _refresh_context_task():
+    """Background task for scheduled context refresh."""
+    try:
+        provider = get_context_provider()
+        updated = provider.refresh()
+        if updated:
+            print(f"[Scheduler] Context refreshed at {datetime.now().isoformat()}")
+        else:
+            print(f"[Scheduler] Context already up-to-date at {datetime.now().isoformat()}")
+    except Exception as e:
+        print(f"[Scheduler] Failed to refresh context: {e}")
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class CompileSemanticQueryRequest(BaseModel):
+    insight_project_folder: str
+    metrics: list[str]
+    group_by: list[str] = []
+    where: list[str] = []
+    order_by: list[str] = []
+    limit: int | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    env_vars: dict[str, str] | None = None
+
+
+class CompileSemanticQueryResponse(BaseModel):
+    sql: str
+    database_id: str
+    dialect: str
+
+
+def _validate_sql(
+    sql: str,
+    db_config,
+    project_path: Path,
+    enforce_excluded_columns: bool,
+    conn=None,
+    group_allowed_tables: set[tuple[str, str]] | None = None,
+    row_security_policies: dict[tuple[str, str], RowSecurityPolicy] | None = None,
+    database_folder: str | None = None,
+) -> str:
+    validated_sql = enforce_allow_listed_only(
+        sql,
+        db_config,
+        project_path,
+        conn=conn,
+        group_allowed_tables=group_allowed_tables,
+        database_folder=database_folder,
+    )
+    if enforce_excluded_columns:
+        validated_sql = validate_column_access(validated_sql, db_config, project_path, database_folder)
+    validated_sql = enforce_row_security(
+        validated_sql,
+        db_config,
+        row_security_policies,
+        conn=conn,
+    )
+    return validated_sql
+
+
+def _execute_sql_with_guards(
+    sql: str,
+    db_config,
+    project_path: Path,
+    enforce_excluded_columns: bool,
+    group_allowed_tables: set[tuple[str, str]] | None,
+    row_security_policies: dict[tuple[str, str], RowSecurityPolicy] | None,
+    database_folder: str,
+) -> pd.DataFrame:
+    conn = db_config.connect()
+    try:
+        validated_sql = _validate_sql(
+            sql,
+            db_config,
+            project_path,
+            enforce_excluded_columns,
+            conn=conn,
+            group_allowed_tables=group_allowed_tables,
+            row_security_policies=row_security_policies,
+            database_folder=database_folder,
+        )
+        return db_config.execute_sql(validated_sql, conn=conn)
+    finally:
+        conn.disconnect()
+
+
+def _convert_value(v: object):
+    """Convert a DataFrame cell to a JSON-serializable Python type."""
+    if v is None:
+        return None
+
+    # Handle float NaN / Infinity early (common in pandas output)
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+
+    # Handle pandas NA / NaT sentinels
+    if v is pd.NA or v is pd.NaT:
+        return None
+
+    # Numpy scalar types
+    if isinstance(v, np.bool_):
+        return bool(v)
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, np.floating):
+        val = float(v)
+        return None if math.isnan(val) or math.isinf(val) else val
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+
+    # Python / DB types that aren't JSON-serializable by default
+    if isinstance(v, Decimal):
+        if v.is_nan() or v.is_infinite():
+            return None
+        return float(v)
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="replace")
+
+    # Catch-all for remaining numpy scalars (e.g. np.str_, np.bytes_)
+    item_method = getattr(v, "item", None)
+    if callable(item_method):
+        return item_method()
+
+    return v
+
+
+def require_internal_secret(
+    provided: Annotated[str | None, Header(alias="X-Insight-Internal-Secret")] = None,
+):
+    """Only the Insight backend, which shares BETTER_AUTH_SECRET, may call internal routes."""
+    expected = os.environ.get("BETTER_AUTH_SECRET")
+    if not expected:
+        raise HTTPException(
+            status_code=503, detail="BETTER_AUTH_SECRET is not configured"
+        )
+    if provided is None or not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid internal secret")
+
+
+internal_only = [Depends(require_internal_secret)]
+
+
+def _load_database(request: ExecuteSQLRequest) -> tuple[Path, Any, str]:
+    project_path = Path(request.insight_project_folder)
+    config = InsightConfig.try_load(
+        project_path,
+        raise_on_error=True,
+        extra_env=request.env_vars,
+    )
+    assert config is not None
+    db_config, database_folder = _resolve_database(config, request.database_id)
+    return project_path, db_config, database_folder
+
+
+def _resolve_database(config: Any, database_id: str | None) -> tuple[Any, str]:
+    if len(config.databases) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No databases configured in insight_config.yaml",
+        )
+
+    names = [db.name for db in config.databases]
+    duplicate_names = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        raise HTTPException(
+            status_code=400,
+            detail=("Database connection names must be unique. Duplicate name(s): " + ", ".join(duplicate_names)),
+        )
+
+    if len(config.databases) == 1:
+        selected_index = 0
+    elif database_id:
+        selected_index = next(
+            (index for index, db in enumerate(config.databases) if db.name == database_id),
+            None,
+        )
+        if selected_index is None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": f"Database '{database_id}' not found",
+                    "available_databases": [db.name for db in config.databases],
+                },
+            )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Multiple databases configured. Please specify database_id.",
+                "available_databases": [db.name for db in config.databases],
+            },
+        )
+
+    db_config = config.databases[selected_index]
+    database_folders = get_database_folder_names(config.databases)
+    database_folder = database_folders[selected_index]
+    authorization_identity = (str(db_config.type).lower(), database_folder)
+    matching_identities = [
+        index
+        for index, (candidate, candidate_folder) in enumerate(zip(config.databases, database_folders, strict=True))
+        if (str(candidate.type).lower(), candidate_folder) == authorization_identity
+    ]
+    if len(matching_identities) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Database authorization identity is ambiguous for connection "
+                f"'{db_config.name}' ({authorization_identity[0]}, {database_folder})."
+            ),
+        )
+
+    return db_config, database_folder
+
+
+def _active_group_allowed_tables(
+    table_access: TableAccess,
+    db_config: Any,
+    database_folder: str,
+) -> set[tuple[str, str]] | None:
+    if not table_access.enforced:
+        return None
+
+    database_folder_name = database_folder.removeprefix("database=")
+    database_type = str(db_config.type).lower()
+    return {
+        (entry.schema_name, entry.table)
+        for entry in table_access.tables
+        if entry.database_type.lower() == database_type and entry.database == database_folder_name
+    }
+
+
+def _active_row_security_policies(
+    row_security: RowSecurity,
+    db_config: Any,
+    database_folder: str,
+) -> dict[tuple[str, str], RowSecurityPolicy] | None:
+    if not row_security.enforced:
+        return None
+
+    database_folder_name = database_folder.removeprefix("database=")
+    database_type = str(db_config.type).lower()
+    policies: dict[tuple[str, str], RowSecurityPolicy] = {}
+    for entry in row_security.tables:
+        if entry.database_type.lower() != database_type or entry.database != database_folder_name:
+            continue
+        identity = (entry.schema_name, entry.table)
+        if identity in policies:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Duplicate row security policy for {entry.schema_name}.{entry.table}.",
+            )
+        if entry.access == "blocked":
+            policies[identity] = {
+                "access": "blocked",
+                "constraint_columns": entry.constraint_columns,
+                "reason": entry.reason,
+            }
+        else:
+            policies[identity] = {
+                "access": entry.access,
+                "constraint_columns": entry.constraint_columns,
+                "predicate": getattr(entry, "predicate", None),
+            }
+    return policies
+
+
+def _is_azure_entra_id(db_config: Any) -> bool:
+    return getattr(getattr(db_config, "auth_mode", None), "value", None) == ("azure_entra_id")
+
+
+def _assert_azure_request_can_validate(
+    request: ExecuteSQLRequest,
+    db_config: Any,
+    group_allowed_tables: set[tuple[str, str]] | None,
+    row_security_policies: dict[tuple[str, str], RowSecurityPolicy] | None,
+) -> None:
+    if not _is_azure_entra_id(db_config):
+        return
+    if not request.azure_access_token:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "azure_access_token is required when the database auth_mode is "
+                "'azure_entra_id'. Runtime queries must use the end user's access "
+                "token; any configured user/password is only used by insight sync."
+            ),
+        )
+
+    table_validation_enabled = (
+        db_config.allow_listed_only or group_allowed_tables is not None or row_security_policies is not None
+    )
+    if (
+        table_validation_enabled
+        and query_references_base_tables(request.sql, db_config.type)
+        and (not getattr(db_config, "user", None) or not getattr(db_config, "password", None))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Queries that reference tables require sync user and password "
+                "when table access validation is enabled with auth_mode "
+                "'azure_entra_id'. These credentials are used only to validate "
+                "the query against the live schema and context rules; the query "
+                "still executes with the end user's access token."
+            ),
+        )
+
+
+def _validate_request(
+    request: ExecuteSQLRequest,
+    db_config: Any,
+    project_path: Path,
+    group_allowed_tables: set[tuple[str, str]] | None,
+    row_security_policies: dict[tuple[str, str], RowSecurityPolicy] | None,
+    database_folder: str,
+) -> str:
+    _assert_azure_request_can_validate(request, db_config, group_allowed_tables, row_security_policies)
+    return _validate_sql(
+        request.sql,
+        db_config,
+        project_path,
+        request.enforce_excluded_columns,
+        group_allowed_tables=group_allowed_tables,
+        row_security_policies=row_security_policies,
+        database_folder=database_folder,
+    )
+
+
+# =============================================================================
+# API Endpoints
+# =============================================================================
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint with context status."""
+    try:
+        provider = get_context_provider()
+        context_source = os.environ.get("INSIGHT_CONTEXT_SOURCE", "local")
+        return HealthResponse(
+            status="ok",
+            context_source=context_source,
+            context_initialized=provider.is_initialized(),
+            refresh_schedule=os.environ.get("INSIGHT_REFRESH_SCHEDULE"),
+        )
+    except Exception:
+        return HealthResponse(
+            status="error",
+            context_source=os.environ.get("INSIGHT_CONTEXT_SOURCE", "local"),
+            context_initialized=False,
+            refresh_schedule=os.environ.get("INSIGHT_REFRESH_SCHEDULE"),
+        )
+
+
+@app.post("/execute_sql", response_model=ExecuteSQLResponse, dependencies=internal_only)
+async def execute_sql(request: ExecuteSQLRequest):
+    try:
+        project_path, db_config, database_folder = _load_database(request)
+        group_allowed_tables = _active_group_allowed_tables(request.table_access, db_config, database_folder)
+        row_security_policies = _active_row_security_policies(request.row_security, db_config, database_folder)
+        try:
+            if _is_azure_entra_id(db_config):
+                validated_sql = _validate_request(
+                    request,
+                    db_config,
+                    project_path,
+                    group_allowed_tables,
+                    row_security_policies,
+                    database_folder,
+                )
+                df = db_config.execute_sql_with_token(
+                    validated_sql,
+                    request.azure_access_token,
+                )
+            elif db_config.allow_listed_only or group_allowed_tables is not None or row_security_policies is not None:
+                df = _execute_sql_with_guards(
+                    request.sql,
+                    db_config,
+                    project_path,
+                    request.enforce_excluded_columns,
+                    group_allowed_tables,
+                    row_security_policies,
+                    database_folder,
+                )
+            else:
+                validated_sql = _validate_request(
+                    request,
+                    db_config,
+                    project_path,
+                    group_allowed_tables,
+                    row_security_policies,
+                    database_folder,
+                )
+                df = db_config.execute_sql(validated_sql)
+        except (
+            AllowListedOnlyGuardError,
+            ColumnAccessError,
+            RowSecurityGuardError,
+        ) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        data = [{k: _convert_value(v) for k, v in row.items()} for row in df.to_dict(orient="records")]
+
+        return ExecuteSQLResponse(
+            data=data,
+            row_count=len(data),
+            columns=[str(c) for c in df.columns.tolist()],
+            dialect=db_config.type,
+        )
+    except HTTPException:
+        raise
+    except InsightConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/validate_sql",
+    response_model=ValidateSQLResponse,
+    dependencies=internal_only,
+)
+async def validate_sql(request: ExecuteSQLRequest):
+    try:
+        project_path, db_config, database_folder = _load_database(request)
+        group_allowed_tables = _active_group_allowed_tables(request.table_access, db_config, database_folder)
+        row_security_policies = _active_row_security_policies(request.row_security, db_config, database_folder)
+        try:
+            _validate_request(
+                request,
+                db_config,
+                project_path,
+                group_allowed_tables,
+                row_security_policies,
+                database_folder,
+            )
+        except (
+            AllowListedOnlyGuardError,
+            ColumnAccessError,
+            RowSecurityGuardError,
+        ) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return ValidateSQLResponse(valid=True, dialect=db_config.type)
+    except HTTPException:
+        raise
+    except InsightConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/validate_row_predicate",
+    response_model=ValidateRowPredicateResponse,
+    dependencies=internal_only,
+)
+async def validate_row_predicate(request: ValidateRowPredicateRequest):
+    try:
+        normalized = validate_row_security_predicate(
+            request.predicate,
+            request.constraint_columns,
+            request.database_type.lower(),
+        )
+        return ValidateRowPredicateResponse(
+            valid=True,
+            normalized_predicate=normalized,
+        )
+    except RowSecurityGuardError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post(
+    "/semantic_layer/compile",
+    response_model=CompileSemanticQueryResponse,
+    dependencies=internal_only,
+)
+async def compile_semantic_query(request: CompileSemanticQueryRequest):
+    """Compile a metric query to SQL with the project's semantic layer. Execution stays with /execute_sql."""
+    try:
+        project_path = Path(request.insight_project_folder)
+        config = InsightConfig.try_load(
+            project_path, raise_on_error=True, extra_env=request.env_vars
+        )
+        assert config is not None
+
+        semantic_layer = config.semantic_layer
+        if semantic_layer is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No semantic_layer configured in insight_config.yaml",
+            )
+
+        db_config = _resolve_semantic_layer_database(config, semantic_layer.database)
+        dialect = metricflow_dialect_for(db_config.type)
+        engine = MetricFlowSemanticLayer.load(
+            runtime_manifest_path(semantic_layer, project_path), dialect
+        )
+        sql = engine.compile(
+            SemanticQuery(
+                metrics=request.metrics,
+                group_by=request.group_by,
+                where=request.where,
+                order_by=request.order_by,
+                limit=request.limit,
+                start_time=request.start_time,
+                end_time=request.end_time,
+            )
+        )
+        return CompileSemanticQueryResponse(
+            sql=sql, database_id=db_config.name, dialect=db_config.type
+        )
+    except HTTPException:
+        raise
+    except SemanticLayerUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except (InsightConfigError, SemanticLayerError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _resolve_semantic_layer_database(config: InsightConfig, database_name: str | None):
+    if database_name is not None:
+        db_config = next(
+            (db for db in config.databases if db.name == database_name), None
+        )
+        if db_config is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"semantic_layer.database '{database_name}' is not a configured database",
+            )
+        return db_config
+    if len(config.databases) == 1:
+        return config.databases[0]
+    raise HTTPException(
+        status_code=400,
+        detail="semantic_layer.database must name the database that runs semantic queries when several are configured",
+    )
+
+
+# Insight: connections managed from the web app ------------------------------------------
+
+
+class TestConnectionRequest(BaseModel):
+    config: dict[str, Any]
+
+
+class TestConnectionResponse(BaseModel):
+    ok: bool
+    message: str
+
+
+class SyncDatabaseRequest(BaseModel):
+    insight_project_folder: str
+    database_name: str
+    env_vars: dict[str, str] | None = None
+
+
+class SyncDatabaseResponse(BaseModel):
+    ok: bool
+    output: str
+
+
+SYNC_TIMEOUT_SECONDS = 30 * 60
+
+
+@app.post("/test_connection", response_model=TestConnectionResponse, dependencies=internal_only)
+def test_connection(request: TestConnectionRequest):
+    """Connect with a candidate configuration without saving it."""
+    from insight_core.config.databases import parse_database_config
+
+    try:
+        db_config = parse_database_config(request.config)
+    except Exception as e:  # noqa: BLE001 - surface any validation error to the form
+        return TestConnectionResponse(ok=False, message=str(e))
+    ok, message = db_config.check_connection()
+    return TestConnectionResponse(ok=ok, message=message)
+
+
+@app.post("/sync_database", response_model=SyncDatabaseResponse, dependencies=internal_only)
+def sync_database(request: SyncDatabaseRequest):
+    """Run `sync` for one connection so the agent learns its tables, in a child process."""
+    import subprocess
+
+    project = Path(request.insight_project_folder)
+    if not (project / "insight_config.yaml").is_file():
+        raise HTTPException(status_code=400, detail="Project folder has no insight_config.yaml")
+    script = (
+        "import sys; from insight_core.main import main; "
+        f"sys.argv = ['insight', 'sync', '-p', {('databases:' + request.database_name)!r}]; main()"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=project,
+            env={**os.environ, **(request.env_vars or {})},
+            capture_output=True,
+            text=True,
+            timeout=SYNC_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return SyncDatabaseResponse(ok=False, output="Sync timed out")
+    output = (result.stdout + result.stderr)[-4000:]
+    return SyncDatabaseResponse(ok=result.returncode == 0, output=output)
+
+
+class DatabaseContextPathRequest(BaseModel):
+    insight_project_folder: str
+    database_name: str
+    env_vars: dict[str, str] | None = None
+
+
+@app.post("/database_context_path", dependencies=internal_only)
+def database_context_path(request: DatabaseContextPathRequest):
+    """Where `sync` writes a connection's context, so it can be removed with the connection."""
+    project = Path(request.insight_project_folder)
+    config = InsightConfig.try_load(project, raise_on_error=True, extra_env=request.env_vars)
+    assert config is not None
+    for db_config, folder in zip(config.databases, get_database_folder_names(config.databases), strict=True):
+        if db_config.name == request.database_name:
+            return {"path": f"databases/type={db_config.type}/{folder}"}
+    return {"path": None}
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="127.0.0.1", port=port, reload=True)

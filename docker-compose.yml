@@ -1,0 +1,80 @@
+services:
+    postgres:
+        image: postgres:16-alpine
+        container_name: insight_chat_postgres
+        env_file:
+            - .env
+        environment:
+            POSTGRES_USER: ${POSTGRES_USER:-insight}
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-insight}
+            POSTGRES_DB: ${POSTGRES_DB:-insight}
+        ports:
+            - '5432:5432'
+        volumes:
+            - insight_postgres_data:/var/lib/postgresql/data
+        healthcheck:
+            test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-insight} -d ${POSTGRES_DB:-insight}']
+            interval: 5s
+            timeout: 5s
+            retries: 5
+
+    insight:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        ports:
+            - '${SERVER_PORT:-5005}:${SERVER_PORT:-5005}'
+        environment:
+            # =================================================================
+            # Chat Port
+            # =================================================================
+            SERVER_PORT: ${SERVER_PORT:-5005}
+
+            # =================================================================
+            # Authentication & API Keys
+            # =================================================================
+            BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+            OPENAI_API_KEY: ${OPENAI_API_KEY}
+            ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+
+            # =================================================================
+            # Langfuse LLM tracing (optional)
+            # =================================================================
+            LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+            LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+            LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}
+
+            # =================================================================
+            # Database for insight chat history
+            # =================================================================
+            DB_URI: postgres://${POSTGRES_USER:-insight}:${POSTGRES_PASSWORD:-insight}@postgres:5432/${POSTGRES_DB:-insight}
+
+            # =================================================================
+            # Context Configuration
+            # =================================================================
+            # Option A: Local mode (default) - uses bundled example or volume mount
+            INSIGHT_CONTEXT_SOURCE: local
+            INSIGHT_DEFAULT_PROJECT_PATH: /app/example
+
+            # Option B: Git mode - uncomment and configure these instead:
+            # INSIGHT_CONTEXT_SOURCE: git
+            # INSIGHT_CONTEXT_GIT_URL: https://github.com/your-org/your-insight-context.git
+            # INSIGHT_CONTEXT_GIT_BRANCH: main
+            # INSIGHT_CONTEXT_GIT_PLATFORM: github   # override for self-hosted hosts
+            # INSIGHT_CONTEXT_GIT_TOKEN: ${GITHUB_TOKEN}
+            # INSIGHT_DEFAULT_PROJECT_PATH: /app/context
+            # Optional: clone only a subfolder (sparse checkout) — useful for monorepos
+            # INSIGHT_CONTEXT_GIT_SUBPATH: analytics/finance
+            # Option B-bis: SSH deploy key auth (use git@... URL):
+            # INSIGHT_CONTEXT_GIT_URL: git@github.com:your-org/your-insight-context.git
+            # INSIGHT_CONTEXT_GIT_SSH_KEY: ${DEPLOY_KEY}        # raw private key contents
+
+            # Optional: Schedule periodic git pull (cron expression)
+            # INSIGHT_REFRESH_SCHEDULE: "0 * * * *"  # Every hour
+        volumes:
+            - ${INSIGHT_DEFAULT_PROJECT_PATH}:/app/example
+        depends_on:
+            - postgres
+
+volumes:
+    insight_postgres_data:

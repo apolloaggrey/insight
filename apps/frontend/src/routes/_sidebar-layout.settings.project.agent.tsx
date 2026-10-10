@@ -1,0 +1,137 @@
+import { useQuery } from '@tanstack/react-query';
+import { createFileRoute, useNavigate } from '@tanstack/react-router';
+import { isLlmProvider } from '@insight/shared/types';
+import type { LlmProvider } from '@insight/shared/types';
+import type { ProviderToEdit } from '@/components/settings/llm-providers-section';
+import type { TabBarItem } from '@/components/ui/tab-bar';
+
+import { DefaultModelsSection } from '@/components/settings/default-models-section';
+import { McpSettings } from '@/components/settings/display-mcp';
+import { SettingsExcludeColumns } from '@/components/settings/exclude-columns';
+import { SettingsExperimental } from '@/components/settings/experimental';
+import { LlmProvidersSection } from '@/components/settings/llm-providers-section';
+import { SavedPrompts } from '@/components/settings/saved-prompts';
+import { SettingsSandboxSecrets } from '@/components/settings/sandbox-secrets';
+import { SettingsDisplayMap } from '@/components/settings/display-map';
+import { SettingsProjectMemory } from '@/components/settings/project-memory';
+import { SettingsSemanticLayer } from '@/components/settings/semantic-layer';
+import { SettingsTranscribe } from '@/components/settings/settings-transcribe';
+import { SubagentModelSection } from '@/components/settings/subagent-model-section';
+import { SettingsWebSearch } from '@/components/settings/web-search';
+import { SettingsCard } from '@/components/ui/settings-card';
+import { TabBar, TabPanel } from '@/components/ui/tab-bar';
+import { usePermissions } from '@/hooks/use-permissions';
+import { trpc } from '@/main';
+
+type AgentTab = 'models' | 'tools' | 'mcp-servers';
+
+type AgentSearch = {
+	tab: AgentTab;
+	provider?: LlmProvider;
+	model?: string;
+};
+
+const tabs: TabBarItem<AgentTab>[] = [
+	{ id: 'models', label: 'Models' },
+	{ id: 'tools', label: 'Capabilities' },
+	{ id: 'mcp-servers', label: 'MCP servers' },
+];
+
+const tabIdBase = 'project-agent';
+
+export const Route = createFileRoute('/_sidebar-layout/settings/project/agent')({
+	staticData: {
+		title: 'Agent',
+	},
+	validateSearch: (search: Record<string, unknown>): AgentSearch => ({
+		tab: search.tab === 'memory' ? 'tools' : isAgentTab(search.tab) ? search.tab : 'models',
+		provider: typeof search.provider === 'string' && isLlmProvider(search.provider) ? search.provider : undefined,
+		model: typeof search.model === 'string' ? search.model : undefined,
+	}),
+	component: ProjectAgentPage,
+});
+
+function ProjectAgentPage() {
+	const { tab, provider, model } = Route.useSearch();
+	const navigate = useNavigate({ from: Route.fullPath });
+	const { isAdmin } = usePermissions();
+	const providerToEdit = provider ? { provider, modelId: model } : undefined;
+
+	return (
+		<>
+			<TabBar
+				tabs={tabs}
+				activeTab={tab}
+				onTabChange={(nextTab) => {
+					navigate({
+						search: { tab: nextTab },
+						replace: true,
+					});
+				}}
+				idBase={tabIdBase}
+				className='border-b'
+			/>
+			<TabPanel idBase={tabIdBase} tabId={tab} className='flex flex-col gap-12'>
+				{tab === 'models' && (
+					<ModelsSettings
+						isAdmin={isAdmin}
+						providerToEdit={providerToEdit}
+						onProviderToEditOpened={() => navigate({ search: { tab }, replace: true })}
+					/>
+				)}
+				{tab === 'tools' && <ToolsSettings isAdmin={isAdmin} />}
+				{tab === 'mcp-servers' && <McpSettings isAdmin={isAdmin} />}
+			</TabPanel>
+		</>
+	);
+}
+
+function ModelsSettings({
+	isAdmin,
+	providerToEdit,
+	onProviderToEditOpened,
+}: {
+	isAdmin: boolean;
+	providerToEdit?: ProviderToEdit;
+	onProviderToEditOpened: () => void;
+}) {
+	const config = useQuery(trpc.system.getPublicConfig.queryOptions());
+	const subagentsEnabled = config.data?.betaSubagentsEnabled === true;
+
+	return (
+		<>
+			<SettingsCard
+				title='LLM Configuration'
+				description='Configure the LLM providers for the agent in this project.'
+			>
+				<LlmProvidersSection
+					isAdmin={isAdmin}
+					providerToEdit={providerToEdit}
+					onProviderToEditOpened={onProviderToEditOpened}
+				/>
+			</SettingsCard>
+			<DefaultModelsSection isAdmin={isAdmin} />
+			{subagentsEnabled && <SubagentModelSection isAdmin={isAdmin} />}
+			<SettingsTranscribe isAdmin={isAdmin} />
+		</>
+	);
+}
+
+function ToolsSettings({ isAdmin }: { isAdmin: boolean }) {
+	return (
+		<>
+			<SettingsWebSearch isAdmin={isAdmin} />
+			<SavedPrompts isAdmin={isAdmin} />
+			{isAdmin && <SettingsProjectMemory />}
+			<SettingsDisplayMap isAdmin={isAdmin} />
+			<SettingsSemanticLayer isAdmin={isAdmin} />
+			<SettingsExperimental isAdmin={isAdmin} />
+			<SettingsSandboxSecrets />
+			<SettingsExcludeColumns isAdmin={isAdmin} />
+		</>
+	);
+}
+
+function isAgentTab(value: unknown): value is AgentTab {
+	return value === 'models' || value === 'tools' || value === 'mcp-servers';
+}

@@ -1,0 +1,218 @@
+import { documentMediaType, type ImageUploadData } from '@insight/shared/attachments';
+
+import { renderAdminSystemPrompt } from '../components/ai';
+import { noProjectMessage } from '../env';
+import * as chatQueries from '../queries/chat.queries';
+import * as imageQueries from '../queries/image.queries';
+import { adminAgentTools, agentService } from '../services/agent';
+import { mcpService } from '../services/mcp';
+import { skillService } from '../services/skill';
+import type { StorageScope } from '../services/storage';
+import { statUserFile } from '../services/storage/user-files';
+import { AgentRequest, AgentRequestUserMessage, MessageSource, UIMessagePart } from '../types/chat';
+import { createChatTitle } from '../utils/ai';
+import { HandlerError } from '../utils/error';
+import { buildImageUrl } from '../utils/image';
+import { isStoragePath, toStorageRelativePath, toStorageVirtualPath } from '../utils/tools';
+
+interface HandleAgentMessageInput extends AgentRequest {
+	userId: string;
+	projectId: string | undefined;
+}
+
+interface HandleAgentMessageResult {
+	chatId: string;
+	isNewChat: boolean;
+	modelId: string;
+	stream: ReadableStream;
+}
+
+export const handleAgentRoute = async (opts: HandleAgentMessageInput): Promise<HandleAgentMessageResult> => {
+	const { userId, message, messageToEditId, model, mentions, projectId, adminMode } = opts;
+
+	if (!projectId) {
+		throw new HandlerError('BAD_REQUEST', noProjectMessage());
+	}
+
+	await agentService.assertBudget(projectId, model, userId);
+
+	const source: MessageSource = adminMode ? 'admin' : 'web';
+	const scope: StorageScope = { projectId, userId };
+	let chatId = opts.chatId;
+	const isNewChat = !chatId;
+	let newMessageId: string;
+
+	if (!chatId) {
+		const attachmentParts = await buildAttachmentParts(message, scope);
+		const [createdChat, createdMessage] = await createChat(userId, projectId, message, attachmentParts, source);
+		chatId = createdChat.id;
+		newMessageId = createdMessage.id;
+	} else {
+		const { messageId } = await insertOrSupersedeMessage({
+			userId,
+			chatId,
+			message,
+			messageToEditId,
+			source,
+			scope,
+		});
+		newMessageId = messageId;
+	}
+
+	const [chat] = await chatQueries.getChat(chatId);
+	if (!chat) {
+		throw new HandlerError('NOT_FOUND', `Chat with id ${chatId} not found.`);
+	}
+
+	await mcpService.initializeMcpState(projectId);
+	await skillService.initializeSkills(projectId);
+
+	const agent = await agentService.create({ ...chat, userId, projectId }, model, {
+		billingAccessVerifiedProjectId: projectId,
+		...(adminMode
+			? {
+					tools: adminAgentTools,
+					systemPrompt: renderAdminSystemPrompt({ timezone: opts.timezone }),
+					adminMode: true,
+					isBudgetChecked: true,
+				}
+			: { isBudgetChecked: true }),
+	});
+
+	const isForkedFirstMessage =
+		!isNewChat && !!chat.forkMetadata && chat.messages.filter((m) => m.role === 'user' && !m.isForked).length === 1;
+
+	const shouldEmitNewChat = isNewChat || isForkedFirstMessage;
+
+	const stream = agent.stream(chat.messages, {
+		mentions,
+		timezone: opts.timezone,
+		events: {
+			newChat: shouldEmitNewChat
+				? {
+						id: chatId,
+						projectId,
+						title: chat.title,
+						isStarred: chat.isStarred,
+						createdAt: chat.createdAt,
+						updatedAt: chat.updatedAt,
+					}
+				: undefined,
+			newUserMessage: { newId: newMessageId },
+		},
+	});
+
+	return {
+		chatId,
+		isNewChat,
+		modelId: agent.getModelId(),
+		stream,
+	};
+};
+
+/**
+ * Both kinds of attachment become a `file` part, but they get there differently: an image
+ * is stored in the database so it can be inlined for the model, while a document was
+ * already uploaded to permanent storage and is only referenced by its path.
+ */
+async function buildAttachmentParts(message: AgentRequestUserMessage, scope: StorageScope): Promise<UIMessagePart[]> {
+	const [imageParts, documentParts] = await Promise.all([
+		buildImageParts(message.images),
+		buildDocumentParts(message.documents, scope),
+	]);
+
+	return [...imageParts, ...documentParts];
+}
+
+async function buildImageParts(images: ImageUploadData[] | undefined): Promise<UIMessagePart[]> {
+	if (!images?.length) {
+		return [];
+	}
+
+	const savedImages = await imageQueries.saveImages(images);
+	return savedImages.map(({ id, mediaType }) => ({
+		type: 'file' as const,
+		mediaType,
+		url: buildImageUrl(id),
+	}));
+}
+
+async function buildDocumentParts(virtualPaths: string[] | undefined, scope: StorageScope): Promise<UIMessagePart[]> {
+	if (!virtualPaths?.length) {
+		return [];
+	}
+
+	return Promise.all(virtualPaths.map((virtualPath) => buildDocumentPart(virtualPath, scope)));
+}
+
+async function buildDocumentPart(virtualPath: string, scope: StorageScope): Promise<UIMessagePart> {
+	let relativePath = '';
+	try {
+		relativePath = isStoragePath(virtualPath) ? toStorageRelativePath(virtualPath) : '';
+	} catch {
+		throw new HandlerError('BAD_REQUEST', `Invalid attached file path: ${virtualPath}`);
+	}
+	const stored = relativePath ? await statUserFile(scope, relativePath) : null;
+	if (!stored) {
+		throw new HandlerError('BAD_REQUEST', `Attached file not found: ${virtualPath}`);
+	}
+
+	const filename = relativePath.split('/').pop()!;
+	return {
+		type: 'file' as const,
+		mediaType: documentMediaType(filename) ?? 'application/octet-stream',
+		filename,
+		url: toStorageVirtualPath(relativePath),
+	};
+}
+
+const createChat = async (
+	userId: string,
+	projectId: string,
+	message: AgentRequestUserMessage,
+	attachmentParts: UIMessagePart[],
+	source: MessageSource,
+) => {
+	const title = createChatTitle(message);
+	return await chatQueries.createChat(
+		{ title, userId, projectId },
+		{ text: message.text, citation: message.citation, source },
+		attachmentParts,
+	);
+};
+
+/** Insert a message into a chat or supersede an existing message when it is edited. */
+const insertOrSupersedeMessage = async (opts: {
+	userId: string;
+	chatId: string;
+	message: AgentRequestUserMessage;
+	messageToEditId?: string;
+	source: MessageSource;
+	scope: StorageScope;
+}) => {
+	const { userId, chatId, message, messageToEditId, source, scope } = opts;
+	const ownerId = await chatQueries.getChatOwnerId(chatId);
+	if (!ownerId) {
+		throw new HandlerError('NOT_FOUND', `Chat with id ${chatId} not found.`);
+	}
+	if (ownerId !== userId) {
+		throw new HandlerError('FORBIDDEN', 'You are not authorized to access this chat.');
+	}
+
+	const attachmentParts = await buildAttachmentParts(message, scope);
+
+	let versionGroupId: string | undefined;
+	if (messageToEditId) {
+		versionGroupId = await chatQueries.resolveVersionGroupIdForEdit(chatId, messageToEditId);
+		await chatQueries.supersedeMessagesFrom(chatId, messageToEditId);
+	}
+	return chatQueries.upsertMessage({
+		role: 'user',
+		parts: [{ type: 'text', text: message.text }, ...attachmentParts],
+		chatId,
+		senderUserId: userId,
+		source,
+		citation: message.citation,
+		versionGroupId,
+	});
+};

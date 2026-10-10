@@ -1,0 +1,504 @@
+import {
+	Activity,
+	ChevronDown,
+	Code,
+	Ellipsis,
+	Eye,
+	Info,
+	Loader2,
+	Maximize2,
+	Pencil,
+	RotateCcw,
+	Save,
+	X,
+} from 'lucide-react';
+import { memo, useMemo } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import type { ShareSource } from '@insight/shared/types';
+import type { StorySummary } from '@/lib/story.utils';
+import type { StoryViewMode } from './story-viewer.types';
+import type { StoryRefreshFailure } from '@/components/story-page-header';
+import type { StoryDownloadOptions } from '@/components/story-download';
+import type { CustomStoryViewModeControls } from '@/components/custom-story/custom-story-view-mode';
+import { CustomStoryViewModeToggle, isCustomStoryViewMode } from '@/components/custom-story/custom-story-view-mode';
+import { useIsMobile } from '@/hooks/use-is-mobile';
+import { StoryDownloadMenu, canDownloadStory } from '@/components/story-download';
+import { ShareButton, StoryFavoriteMenuItem, StoryFavoritedButton } from '@/components/story-header-actions';
+import { describeViewedVersion, StoryVersionNav } from '@/components/story-version-nav';
+import { EditableStoryTitle } from '@/components/editable-story-title';
+import { Button } from '@/components/ui/button';
+import { trpc } from '@/main';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { SwitchIndicator } from '@/components/ui/switch';
+import { LiveStoryTimestamp, StoryRefreshButton, StoryRefreshFailureBanner } from '@/components/story-page-header';
+import { cn } from '@/lib/utils';
+
+interface StoryViewModeControls {
+	viewMode: StoryViewMode;
+	onViewModeChange: (mode: StoryViewMode) => void;
+}
+
+interface StoryHeaderBaseProps {
+	title: string;
+	chatId: string;
+	storySlug: string;
+	storyId?: string | null;
+	shareSource?: ShareSource | null;
+	allStories: StorySummary[];
+	onSwitchStory: (id: string) => void;
+	currentVersion: number;
+	versionDates: (string | Date)[];
+	versionNumber?: number;
+	versionDate?: string | Date | null;
+	onSelectVersion: (version: number) => void;
+	isViewingLatest: boolean;
+	onRestore: () => void;
+	onSave?: () => void;
+	onCancel?: () => void;
+	onShare: () => void;
+	onOpenAnalytics: () => void;
+	onEnlarge: () => void;
+	isShared: boolean;
+	isAgentRunning: boolean;
+	isStoryUpdating: boolean;
+	isSaving?: boolean;
+	isReadonlyMode: boolean;
+	isReplay?: boolean;
+	isLive: boolean;
+	isLiveUpdating: boolean;
+	isRefreshing: boolean;
+	onRefreshData: () => void;
+	onOpenLiveSettings: () => void;
+	onClose: () => void;
+	isCodeDirty?: boolean;
+	isCodeValid?: boolean;
+	cachedAt?: string | Date | null;
+	lastRefreshFailure?: StoryRefreshFailure | null;
+	onDownload?: StoryDownloadOptions['onDownload'];
+}
+
+export type StoryHeaderProps = StoryHeaderBaseProps & (StoryViewModeControls | CustomStoryViewModeControls);
+
+function mergeStorySummaries(
+	messageStories: StorySummary[],
+	persistedStories: { storySlug: string; title: string }[],
+): StorySummary[] {
+	const storiesBySlug = new Map(messageStories.map((story) => [story.id, story]));
+
+	for (const story of persistedStories) {
+		storiesBySlug.set(story.storySlug, { id: story.storySlug, title: story.title });
+	}
+
+	return Array.from(storiesBySlug.values());
+}
+
+export const StoryHeader = memo(function StoryHeader({
+	title,
+	chatId,
+	storySlug,
+	storyId,
+	shareSource,
+	allStories,
+	onSwitchStory,
+	currentVersion,
+	versionDates,
+	versionNumber,
+	versionDate,
+	onSelectVersion,
+	isViewingLatest,
+	onRestore,
+	onSave,
+	onCancel,
+	onShare,
+	onOpenAnalytics,
+	onEnlarge,
+	isShared,
+	isAgentRunning,
+	isStoryUpdating,
+	isSaving = false,
+	isReadonlyMode,
+	isReplay = false,
+	isLive,
+	isLiveUpdating,
+	isRefreshing,
+	onRefreshData,
+	onOpenLiveSettings,
+	onClose,
+	isCodeDirty = false,
+	isCodeValid = true,
+	cachedAt,
+	lastRefreshFailure,
+	onDownload,
+	...viewModeControls
+}: StoryHeaderProps) {
+	const { viewMode } = viewModeControls;
+	const isMobile = useIsMobile();
+	const { data: persistedStories = [] } = useQuery({
+		...trpc.story.listStories.queryOptions({ chatId }),
+		enabled: !isReadonlyMode,
+	});
+	const stories = useMemo(() => mergeStorySummaries(allStories, persistedStories), [allStories, persistedStories]);
+	const otherStories = useMemo(() => stories.filter((story) => story.id !== storySlug), [stories, storySlug]);
+	const hasMultiple = otherStories.length > 0;
+	const isEditingCode = viewMode === 'code' && isCodeDirty && !isReadonlyMode;
+	const showSubHeader = viewMode === 'edit' || isEditingCode || !isViewingLatest;
+
+	const titleElement = hasMultiple ? (
+		<div className='flex min-w-20 flex-1 items-center gap-1'>
+			<EditableStoryTitle
+				storyId={storyId}
+				title={title}
+				canEdit={!isReadonlyMode}
+				heading='h3'
+				className='min-w-0 truncate text-sm font-medium'
+				inputClassName='text-sm font-medium'
+			/>
+			<DropdownMenu>
+				<DropdownMenuTrigger asChild>
+					<Button
+						type='button'
+						variant='ghost-muted'
+						className='hover:rounded-full'
+						size='icon-sm'
+						aria-label='Switch story'
+					>
+						<ChevronDown className='size-3.5' strokeWidth={2.25} />
+					</Button>
+				</DropdownMenuTrigger>
+				<DropdownMenuContent align='start'>
+					{otherStories.map((story) => (
+						<DropdownMenuItem key={story.id} onClick={() => onSwitchStory(story.id)}>
+							<span className='truncate'>{story.title}</span>
+						</DropdownMenuItem>
+					))}
+				</DropdownMenuContent>
+			</DropdownMenu>
+		</div>
+	) : (
+		<div className='min-w-20 flex-1'>
+			<EditableStoryTitle
+				storyId={storyId}
+				title={title}
+				canEdit={!isReadonlyMode}
+				heading='h3'
+				className='truncate text-sm font-medium'
+				inputClassName='text-sm font-medium'
+			/>
+		</div>
+	);
+
+	const updatingIndicator = isStoryUpdating && (
+		<div className='flex shrink-0 items-center gap-1 text-xs text-muted-foreground' role='status'>
+			<Loader2 className='size-3 animate-spin' strokeWidth={2.25} />
+			<span>Updating…</span>
+		</div>
+	);
+
+	const versionNav = (
+		<StoryVersionNav
+			currentVersion={currentVersion}
+			versionDates={versionDates}
+			onSelectVersion={onSelectVersion}
+		/>
+	);
+
+	const viewModeToggle = (
+		<ViewModeToggle
+			controls={viewModeControls}
+			isReadonlyMode={isReadonlyMode}
+			isAgentRunning={isAgentRunning}
+			isSaving={isSaving}
+		/>
+	);
+
+	const shareButton = !isReadonlyMode && (
+		<ShareButton isShared={isShared} onShare={onShare} disabled={isAgentRunning} />
+	);
+
+	const liveControls = (!isReadonlyMode || isReplay) && (
+		<>
+			<Tooltip>
+				<TooltipTrigger asChild>
+					<span className='inline-flex' tabIndex={isLiveUpdating ? 0 : undefined}>
+						<button
+							type='button'
+							onClick={onOpenLiveSettings}
+							disabled={isReadonlyMode || isAgentRunning || isLiveUpdating}
+							className={cn(
+								'flex items-center gap-2 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 border hover:bg-secondary rounded-full px-2 py-0.75',
+								isLiveUpdating && 'pointer-events-none',
+							)}
+						>
+							<Activity className='size-3.5 text-foreground' strokeWidth={2.25} />
+							<span className='text-xs font-medium'>Live story</span>
+							{isLiveUpdating ? (
+								<Loader2 className='size-3.5 animate-spin' strokeWidth={2.25} />
+							) : (
+								<SwitchIndicator checked={isLive} />
+							)}
+						</button>
+					</span>
+				</TooltipTrigger>
+				<TooltipContent>
+					{isLiveUpdating
+						? 'Updating...'
+						: isReadonlyMode
+							? isLive
+								? 'Live mode on'
+								: 'Live mode off'
+							: isLive
+								? 'Live story settings'
+								: 'Enable live mode'}
+				</TooltipContent>
+			</Tooltip>
+			{isLive && (
+				<>
+					{cachedAt && <LiveStoryTimestamp cachedAt={cachedAt} />}
+					{!isReadonlyMode && <StoryRefreshButton isRefreshing={isRefreshing} onRefresh={onRefreshData} />}
+				</>
+			)}
+		</>
+	);
+
+	const replayAnalyticsButton = isReplay && isReadonlyMode && (
+		<Tooltip>
+			<TooltipTrigger asChild>
+				<Button
+					variant='ghost'
+					size='icon-sm'
+					className='hover:rounded-full'
+					onClick={onOpenAnalytics}
+					aria-label='Analytics'
+				>
+					<Info className='size-3' />
+				</Button>
+			</TooltipTrigger>
+			<TooltipContent>Analytics</TooltipContent>
+		</Tooltip>
+	);
+
+	const downloadOptions = {
+		chatId,
+		storySlug,
+		shareSource: shareSource ?? undefined,
+		isOwner: !isReadonlyMode,
+		versionNumber,
+		onDownload,
+	};
+	const showActionsMenu = !isReadonlyMode || canDownloadStory(downloadOptions);
+	const canFavorite = !isReadonlyMode && !!storyId;
+
+	const favoritedButton = canFavorite && <StoryFavoritedButton storyId={storyId} />;
+
+	const actionButtons = showActionsMenu && (
+		<DropdownMenu>
+			<DropdownMenuTrigger asChild>
+				<Button variant='ghost' size='icon-sm' className='hover:rounded-full' aria-label='More actions'>
+					<Ellipsis className='size-3.5' strokeWidth={2.25} />
+				</Button>
+			</DropdownMenuTrigger>
+			<DropdownMenuContent align='end' className='w-auto min-w-20'>
+				<StoryDownloadMenu {...downloadOptions} isAgentRunning={isAgentRunning} isSaving={isSaving} />
+				{canFavorite && <StoryFavoriteMenuItem storyId={storyId} />}
+				{!isReadonlyMode && (
+					<>
+						<DropdownMenuItem onSelect={onOpenAnalytics}>
+							<Info strokeWidth={2.25} />
+							<span>Analytics</span>
+						</DropdownMenuItem>
+						<DropdownMenuItem onSelect={onEnlarge} disabled={!storyId}>
+							<Maximize2 strokeWidth={2.25} />
+							<span>Expand</span>
+						</DropdownMenuItem>
+					</>
+				)}
+			</DropdownMenuContent>
+		</DropdownMenu>
+	);
+
+	return (
+		<div className='shrink-0' data-selection-ignore>
+			{isMobile ? (
+				<>
+					<div className='flex items-center gap-2 border-b px-3 py-2'>
+						<Button
+							variant='ghost'
+							size='icon-md'
+							className='hover:rounded-full'
+							onClick={onClose}
+							aria-label='Close'
+						>
+							<X className='size-4' strokeWidth={2.25} />
+						</Button>
+						<div className='flex-1' />
+						{viewModeToggle}
+						{liveControls}
+						{favoritedButton}
+						{shareButton}
+						{replayAnalyticsButton}
+						{actionButtons}
+					</div>
+					<div className='flex items-center gap-2 border-b px-4 py-2'>
+						{titleElement}
+						{updatingIndicator}
+						{versionNav}
+					</div>
+				</>
+			) : (
+				<div className='flex items-center gap-2 border-b px-4 py-2'>
+					<Button
+						variant='ghost'
+						size='icon-sm'
+						className='mr-2 hover:rounded-full'
+						onClick={onClose}
+						aria-label='Close'
+					>
+						<X className='size-3.5' strokeWidth={2.25} />
+					</Button>
+					{titleElement}
+					{updatingIndicator}
+					{versionNav}
+					{viewModeToggle}
+					{liveControls}
+					{favoritedButton}
+					{shareButton}
+					{replayAnalyticsButton}
+					{actionButtons}
+				</div>
+			)}
+
+			{lastRefreshFailure && <StoryRefreshFailureBanner failure={lastRefreshFailure} isRetrying={isRefreshing} />}
+			{showSubHeader && (
+				<div className='flex items-center justify-between border-b bg-muted/40 px-4 py-2'>
+					{viewMode === 'edit' ? (
+						<>
+							<span className='text-xs text-muted-foreground'>Editing</span>
+							<div className='flex items-center gap-2'>
+								<Button variant='outline' size='sm' onClick={onCancel} disabled={isSaving}>
+									Cancel
+								</Button>
+								<Button
+									variant='primary-gradient'
+									size='sm'
+									onClick={onSave}
+									disabled={isSaving}
+									isLoading={isSaving}
+									className='gap-1.5'
+								>
+									<Save className='size-3' strokeWidth={2.25} />
+									<span>Save</span>
+									<kbd className='text-[10px] opacity-60 font-sans'>⌘S</kbd>
+								</Button>
+							</div>
+						</>
+					) : isEditingCode ? (
+						<>
+							<span className='text-xs text-muted-foreground'>
+								{isCodeValid ? 'Editing code' : 'Fix validation errors to save'}
+							</span>
+							<div className='flex items-center gap-2'>
+								<Button variant='outline' size='sm' onClick={onCancel} disabled={isSaving}>
+									Cancel
+								</Button>
+								<Button
+									variant='primary-gradient'
+									size='sm'
+									onClick={onSave}
+									disabled={isSaving || !isCodeValid}
+									isLoading={isSaving}
+									className='gap-1.5'
+								>
+									<Save className='size-3' strokeWidth={2.25} />
+									<span>Save</span>
+									<kbd className='text-[10px] opacity-60 font-sans'>⌘S</kbd>
+								</Button>
+							</div>
+						</>
+					) : (
+						<>
+							<span className='text-xs text-muted-foreground'>
+								{describeViewedVersion(versionDate, currentVersion)}
+							</span>
+							<Button
+								variant='outline'
+								size='sm'
+								onClick={onRestore}
+								disabled={isSaving}
+								className='gap-1.5'
+							>
+								<RotateCcw className='size-3' strokeWidth={2.25} />
+								<span>Restore</span>
+							</Button>
+						</>
+					)}
+				</div>
+			)}
+		</div>
+	);
+});
+
+interface ViewModeToggleProps {
+	controls: StoryViewModeControls | CustomStoryViewModeControls;
+	isReadonlyMode: boolean;
+	isAgentRunning: boolean;
+	isSaving: boolean;
+}
+
+function ViewModeToggle({ controls, isReadonlyMode, isAgentRunning, isSaving }: ViewModeToggleProps) {
+	if (isCustomStoryViewModeControls(controls)) {
+		return <CustomStoryViewModeToggle {...controls} />;
+	}
+
+	const { viewMode, onViewModeChange } = controls;
+
+	return (
+		<div className='flex items-center rounded-full border p-0.5 gap-1.5'>
+			<Button
+				variant='ghost'
+				className={cn(
+					'size-5.5 px-2',
+					viewMode === 'preview' && 'bg-accent rounded-full',
+					'hover:rounded-full',
+				)}
+				onClick={() => onViewModeChange('preview')}
+				disabled={isSaving}
+			>
+				<Eye className='size-3' strokeWidth={2.25} />
+			</Button>
+			{!isReadonlyMode && (
+				<Button
+					variant='ghost'
+					className={cn(
+						'size-5.5 px-2',
+						viewMode === 'edit' && 'bg-accent rounded-full',
+						'hover:rounded-full',
+					)}
+					onClick={() => onViewModeChange('edit')}
+					disabled={isAgentRunning || isSaving}
+				>
+					<Pencil className='size-3' strokeWidth={2.25} />
+				</Button>
+			)}
+			<Button
+				variant='ghost'
+				className={cn('size-5.5 px-2', viewMode === 'code' && 'bg-accent rounded-full', 'hover:rounded-full')}
+				onClick={() => onViewModeChange('code')}
+				disabled={isSaving}
+			>
+				<Code className='size-3' strokeWidth={2.25} />
+			</Button>
+		</div>
+	);
+}
+
+function isCustomStoryViewModeControls(
+	controls: StoryViewModeControls | CustomStoryViewModeControls,
+): controls is CustomStoryViewModeControls {
+	return isCustomStoryViewMode(controls.viewMode);
+}

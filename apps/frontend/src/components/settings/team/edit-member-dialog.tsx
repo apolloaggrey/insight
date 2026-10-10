@@ -1,0 +1,156 @@
+import { useState, useEffect } from 'react';
+import { useForm } from '@tanstack/react-form';
+import { ChevronDown } from 'lucide-react';
+import { USER_ROLE_LABELS, USER_ROLES } from '@insight/shared/types';
+import type { UserRole } from '@insight/shared/types';
+
+import type { TeamMember } from './types';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import {
+	DropdownMenu,
+	DropdownMenuItem,
+	DropdownMenuContent,
+	DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { useSsoRoleMapping } from '@/hooks/use-sso-role-mapping';
+
+interface EditMemberDialogProps {
+	open: boolean;
+	onOpenChange: (open: boolean) => void;
+	member: TeamMember | null;
+	isAdmin: boolean;
+	roleScope: 'organization' | 'project';
+	availableRoles?: readonly UserRole[];
+	onSubmit: (data: { userId: string; name?: string; newRole?: UserRole }) => Promise<void>;
+}
+
+export function EditMemberDialog({
+	open,
+	onOpenChange,
+	member,
+	isAdmin,
+	roleScope,
+	availableRoles = USER_ROLES,
+	onSubmit,
+}: EditMemberDialogProps) {
+	const [error, setError] = useState('');
+	const { organizationRolesManagedByIdp, providerName, isLoading } = useSsoRoleMapping();
+	const isOrganizationRole = roleScope === 'organization';
+	const isRoleEditingDisabled = isOrganizationRole && (organizationRolesManagedByIdp || isLoading);
+
+	const form = useForm({
+		defaultValues: {
+			name: member?.name ?? '',
+			role: member?.role ?? 'user',
+		},
+		onSubmit: async ({ value }) => {
+			if (!member) {
+				return;
+			}
+			setError('');
+			try {
+				await onSubmit({
+					userId: member.id,
+					name: value.name,
+					newRole: isRoleEditingDisabled ? undefined : value.role,
+				});
+				onOpenChange(false);
+			} catch (err) {
+				setError(err instanceof Error ? err.message : String(err));
+			}
+		},
+	});
+
+	useEffect(() => {
+		if (open && member) {
+			form.reset();
+			form.setFieldValue('name', member.name);
+			form.setFieldValue('role', member.role);
+		}
+	}, [open, member, form]);
+
+	return (
+		<Dialog open={open} onOpenChange={onOpenChange}>
+			<DialogContent>
+				<DialogHeader>
+					<DialogTitle>Edit Profile</DialogTitle>
+				</DialogHeader>
+				<form
+					onSubmit={(e) => {
+						e.preventDefault();
+						e.stopPropagation();
+						form.handleSubmit();
+					}}
+					className='flex flex-col gap-4'
+				>
+					<form.Field name='name'>
+						{(field) => (
+							<div className='flex flex-col gap-2'>
+								<label htmlFor='edit-member-name' className='text-sm font-medium'>
+									Name
+								</label>
+								<Input
+									id='edit-member-name'
+									type='text'
+									placeholder='Name'
+									value={field.state.value}
+									onChange={(e) => field.handleChange(e.target.value)}
+								/>
+							</div>
+						)}
+					</form.Field>
+
+					{isAdmin && (
+						<form.Field name='role'>
+							{(field) => (
+								<div className='flex flex-col gap-2'>
+									<label htmlFor='edit-member-role' className='text-sm font-medium'>
+										Role
+									</label>
+									<DropdownMenu>
+										<DropdownMenuTrigger asChild disabled={isRoleEditingDisabled}>
+											<Button
+												variant='outline'
+												className='w-full justify-between'
+												disabled={isRoleEditingDisabled}
+											>
+												<span>{USER_ROLE_LABELS[field.state.value]}</span>
+												<ChevronDown className='h-4 w-4 opacity-50' />
+											</Button>
+										</DropdownMenuTrigger>
+										<DropdownMenuContent align='start' className='w-full'>
+											{availableRoles.map((role) => (
+												<DropdownMenuItem
+													key={role}
+													onClick={() => field.handleChange(role)}
+													className={field.state.value === role ? 'bg-accent' : ''}
+												>
+													<span>{USER_ROLE_LABELS[role]}</span>
+												</DropdownMenuItem>
+											))}
+										</DropdownMenuContent>
+									</DropdownMenu>
+									{isOrganizationRole && organizationRolesManagedByIdp && (
+										<p className='text-xs text-muted-foreground'>
+											Organization roles are assigned from {providerName} groups and refresh when
+											the user signs in again.
+										</p>
+									)}
+								</div>
+							)}
+						</form.Field>
+					)}
+
+					{error && <p className='text-red-500 text-center text-sm'>{error}</p>}
+					<div className='flex justify-end'>
+						<Button type='submit' variant='primary-gradient' className='rounded-full'>
+							Validate changes
+						</Button>
+					</div>
+				</form>
+			</DialogContent>
+		</Dialog>
+	);
+}

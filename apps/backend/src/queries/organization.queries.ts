@@ -1,0 +1,568 @@
+import type { MemberStatus, UserRole } from '@insight/shared/types';
+import { and, asc, count, eq, isNotNull, isNull, sql } from 'drizzle-orm';
+
+import s, { DBOrganization, DBOrgMember, NewOrganization, NewOrgMember } from '../db/abstractSchema';
+import { db } from '../db/db';
+import { env } from '../env';
+import { OrgRole } from '../types/organization';
+import * as projectQueries from './project.queries';
+import * as userQueries from './user.queries';
+
+export const getOrganizationById = async (id: string): Promise<DBOrganization | null> => {
+	const [org] = await db.select().from(s.organization).where(eq(s.organization.id, id)).execute();
+	return org ?? null;
+};
+
+export const getOrganizationBySlug = async (slug: string): Promise<DBOrganization | null> => {
+	const [org] = await db.select().from(s.organization).where(eq(s.organization.slug, slug)).execute();
+	return org ?? null;
+};
+
+export const getFirstOrganization = async (): Promise<DBOrganization | null> => {
+	const [org] = await db.select().from(s.organization).limit(1).execute();
+	return org ?? null;
+};
+
+export const createOrganization = async (org: NewOrganization): Promise<DBOrganization> => {
+	const [created] = await db.insert(s.organization).values(org).returning().execute();
+	return created;
+};
+
+export const getOrgMember = async (orgId: string, userId: string): Promise<DBOrgMember | null> => {
+	const [member] = await db
+		.select()
+		.from(s.orgMember)
+		.where(and(eq(s.orgMember.orgId, orgId), eq(s.orgMember.userId, userId)))
+		.execute();
+	return member ?? null;
+};
+
+export const addOrgMember = async (member: NewOrgMember): Promise<DBOrgMember> => {
+	const [created] = await db.insert(s.orgMember).values(member).returning().execute();
+	return created;
+};
+
+export const addOrgMemberIfMissing = async (member: NewOrgMember): Promise<void> => {
+	await db.insert(s.orgMember).values(member).onConflictDoNothing().execute();
+};
+
+type UserOrgMembership = DBOrgMember & { organization: DBOrganization };
+
+export const getUserOrgMembership = async (
+	userId: string,
+	selectedOrganizationId?: string | null,
+): Promise<UserOrgMembership | null> => {
+	if (selectedOrganizationId) {
+		return findUserOrgMembership(userId, selectedOrganizationId);
+	}
+
+	return findUserOrgMembership(userId);
+};
+
+export const listUserOrgMemberships = async (userId: string) => {
+	return db
+		.select({
+			id: s.organization.id,
+			name: s.organization.name,
+			role: s.orgMember.role,
+		})
+		.from(s.orgMember)
+		.innerJoin(s.organization, eq(s.orgMember.orgId, s.organization.id))
+		.where(eq(s.orgMember.userId, userId))
+		.orderBy(asc(s.organization.name), asc(s.organization.id))
+		.execute();
+};
+
+const findUserOrgMembership = async (userId: string, organizationId?: string): Promise<UserOrgMembership | null> => {
+	const [result] = await db
+		.select({
+			orgId: s.orgMember.orgId,
+			userId: s.orgMember.userId,
+			role: s.orgMember.role,
+			createdAt: s.orgMember.createdAt,
+			organization: s.organization,
+		})
+		.from(s.orgMember)
+		.innerJoin(s.organization, eq(s.orgMember.orgId, s.organization.id))
+		.where(
+			organizationId
+				? and(eq(s.orgMember.userId, userId), eq(s.orgMember.orgId, organizationId))
+				: eq(s.orgMember.userId, userId),
+		)
+		.orderBy(asc(s.orgMember.createdAt))
+		.limit(1)
+		.execute();
+	return result ?? null;
+};
+
+export const getUserOrgMembershipByProject = async (
+	userId: string,
+	projectId: string,
+): Promise<UserOrgMembership | null> => {
+	const [result] = await db
+		.select({
+			orgId: s.orgMember.orgId,
+			userId: s.orgMember.userId,
+			role: s.orgMember.role,
+			createdAt: s.orgMember.createdAt,
+			organization: s.organization,
+		})
+		.from(s.orgMember)
+		.innerJoin(s.organization, eq(s.orgMember.orgId, s.organization.id))
+		.innerJoin(s.project, eq(s.project.orgId, s.organization.id))
+		.where(and(eq(s.orgMember.userId, userId), eq(s.project.id, projectId)))
+		.limit(1)
+		.execute();
+	return result ?? null;
+};
+
+export const getUserRoleInOrg = async (orgId: string, userId: string): Promise<OrgRole | null> => {
+	const member = await getOrgMember(orgId, userId);
+	return member?.role ?? null;
+};
+
+export const updateGoogleSettings = async (
+	orgId: string,
+	settings: {
+		googleClientId: string | null;
+		googleClientSecret: string | null;
+		googleAuthDomains: string | null;
+	},
+): Promise<DBOrganization> => {
+	const [updated] = await db
+		.update(s.organization)
+		.set(settings)
+		.where(eq(s.organization.id, orgId))
+		.returning()
+		.execute();
+	return updated;
+};
+
+export const getGoogleConfig = async () => {
+	const org = await getFirstOrganization();
+	return buildGoogleConfig(org, true);
+};
+
+export const getGoogleConfigForOrganization = async (orgId: string, includeEnvFallback = false) => {
+	const org = await getOrganizationById(orgId);
+	return buildGoogleConfig(org, includeEnvFallback);
+};
+
+/**
+ * Cloud mode: find the organization that claims a user's email domain.
+ * Domains are stored per-organization as a comma-separated list in `googleAuthDomains`.
+ * The first organization whose list contains the domain wins.
+ */
+export const findOrganizationByEmailDomain = async (email: string): Promise<DBOrganization | null> => {
+	const domain = email.split('@').at(1)?.trim().toLowerCase();
+	if (!domain) {
+		return null;
+	}
+
+	const orgs = await db
+		.select()
+		.from(s.organization)
+		.where(isNotNull(s.organization.googleAuthDomains))
+		.orderBy(asc(s.organization.createdAt))
+		.execute();
+
+	return orgs.find((org) => parseEmailDomains(org.googleAuthDomains).includes(domain)) ?? null;
+};
+
+export const updateOrganizationName = async (orgId: string, name: string): Promise<void> => {
+	await db.update(s.organization).set({ name }).where(eq(s.organization.id, orgId)).execute();
+};
+
+export const updateOrganizationBypassBilling = async (orgId: string, bypassBilling: boolean): Promise<void> => {
+	await db.update(s.organization).set({ bypassBilling }).where(eq(s.organization.id, orgId)).execute();
+};
+
+export const updateOrganizationEmailDomains = async (orgId: string, domains: string | null): Promise<void> => {
+	await db.update(s.organization).set({ googleAuthDomains: domains }).where(eq(s.organization.id, orgId)).execute();
+};
+
+/**
+ * Cloud mode: the set of email domains the organization can prove it owns,
+ * derived from its members that have a verified email address.
+ */
+export const getVerifiedMemberEmailDomains = async (orgId: string): Promise<Set<string>> => {
+	const rows = await db
+		.select({ email: s.user.email })
+		.from(s.orgMember)
+		.innerJoin(s.user, eq(s.orgMember.userId, s.user.id))
+		.where(and(eq(s.orgMember.orgId, orgId), eq(s.user.emailVerified, true)))
+		.execute();
+
+	const domains = new Set<string>();
+	for (const { email } of rows) {
+		const domain = email.split('@').at(1)?.trim().toLowerCase();
+		if (domain) {
+			domains.add(domain);
+		}
+	}
+	return domains;
+};
+
+/** Cloud mode: whether another organization has already claimed the given email domain. */
+export const isEmailDomainClaimedByAnotherOrg = async (domain: string, orgId: string): Promise<boolean> => {
+	const normalized = domain.trim().toLowerCase();
+	const orgs = await db.select().from(s.organization).where(isNotNull(s.organization.googleAuthDomains)).execute();
+	return orgs.some((org) => org.id !== orgId && parseEmailDomains(org.googleAuthDomains).includes(normalized));
+};
+
+function parseEmailDomains(domains: string | null): string[] {
+	if (!domains) {
+		return [];
+	}
+	return domains
+		.split(',')
+		.map((domain) => domain.trim().toLowerCase())
+		.filter(Boolean);
+}
+
+function buildGoogleConfig(org: DBOrganization | null, includeEnvFallback: boolean) {
+	const envClientId = includeEnvFallback ? env.GOOGLE_CLIENT_ID : undefined;
+	const envClientSecret = includeEnvFallback ? env.GOOGLE_CLIENT_SECRET : undefined;
+	const envAuthDomains = includeEnvFallback ? env.GOOGLE_AUTH_DOMAINS : undefined;
+
+	return {
+		orgId: org?.id,
+		clientId: org?.googleClientId || envClientId || '',
+		clientSecret: org?.googleClientSecret || envClientSecret || '',
+		authDomains: org?.googleAuthDomains || envAuthDomains || '',
+		usingDbOverride: !!(org?.googleClientId && org?.googleClientSecret),
+	};
+}
+
+export const getOrCreateDefaultOrganization = async (): Promise<DBOrganization> => {
+	const existing = await getFirstOrganization();
+	if (existing) {
+		return existing;
+	}
+
+	return createOrganization({
+		name: 'Default Organization',
+		slug: 'default',
+	});
+};
+
+/**
+ * Initialize default organization and project for the first user.
+ * Creates the organization, adds the user as admin, and creates the default project.
+ * All operations are wrapped in a transaction.
+ */
+export const initializeDefaultOrganizationForFirstUser = async (userId: string): Promise<void> => {
+	const userCount = await userQueries.countUsers();
+	if (userCount !== 1) {
+		return;
+	}
+
+	const existingOrg = await getFirstOrganization();
+	if (existingOrg) {
+		return;
+	}
+
+	await db.transaction(async (tx) => {
+		// Create organization
+		const [org] = await tx
+			.insert(s.organization)
+			.values({ name: 'Default Organization', slug: 'default' })
+			.returning()
+			.execute();
+
+		// Add user as org admin
+		await tx.insert(s.orgMember).values({ orgId: org.id, userId, role: 'admin' }).execute();
+
+		const projectPath = env.INSIGHT_DEFAULT_PROJECT_PATH;
+		if (projectPath) {
+			const [existingProject] = await tx
+				.select()
+				.from(s.project)
+				.where(eq(s.project.path, projectPath))
+				.execute();
+
+			if (!existingProject) {
+				const projectName = projectPath.split('/').pop() || 'Default Project';
+				const project = await projectQueries.createProject(
+					{ name: projectName, type: 'local', path: projectPath, orgId: org.id },
+					tx,
+				);
+
+				await tx.insert(s.projectMember).values({ projectId: project.id, userId, role: 'admin' }).execute();
+			}
+		}
+	});
+};
+
+export const addUserToDefaultOrganizationIfExists = async (userId: string): Promise<void> => {
+	const existingMembership = await getUserOrgMembership(userId);
+	if (existingMembership) {
+		return;
+	}
+
+	const org = await getFirstOrganization();
+	if (!org) {
+		return;
+	}
+
+	await addOrgMemberIfMissing({
+		orgId: org.id,
+		userId,
+		role: env.DEFAULT_USER_ROLE,
+	});
+};
+
+/**
+ * Add a user to the default organization and project if they don't already exist.
+ * Called when a new user signs up.
+ * Idempotent: safe to call multiple times for the same user.
+ */
+export const addUserToDefaultProjectIfExists = async (userId: string): Promise<void> => {
+	const org = await getFirstOrganization();
+	if (!org) {
+		return;
+	}
+
+	const project = await projectQueries.getDefaultProject();
+	if (!project) {
+		return;
+	}
+
+	const role = env.DEFAULT_USER_ROLE;
+
+	await db.transaction(async (tx) => {
+		const existingOrgMember = await tx.query.orgMember.findFirst({
+			where: and(eq(s.orgMember.orgId, org.id), eq(s.orgMember.userId, userId)),
+		});
+		if (!existingOrgMember) {
+			await tx.insert(s.orgMember).values({ orgId: org.id, userId, role }).execute();
+		}
+
+		const existingProjectMember = await tx.query.projectMember.findFirst({
+			where: and(eq(s.projectMember.projectId, project.id), eq(s.projectMember.userId, userId)),
+		});
+		if (!existingProjectMember) {
+			await tx.insert(s.projectMember).values({ projectId: project.id, userId, role }).execute();
+		}
+	});
+};
+
+/**
+ * Cloud mode: create a personal default organization for a new user.
+ * Skips if the user is already a member of any organization (e.g. invited before signup).
+ */
+export const initializePersonalOrganization = async (userId: string): Promise<void> => {
+	const existingMembership = await getUserOrgMembership(userId);
+	if (existingMembership) {
+		return;
+	}
+
+	const user = await userQueries.getUser({ id: userId });
+	const orgName = user ? `${user.name}'s Organization` : 'Personal Organization';
+	const orgSlug = `org-${userId.replace(/-/g, '').slice(0, 16)}`;
+
+	await db.transaction(async (tx) => {
+		const [org] = await tx.insert(s.organization).values({ name: orgName, slug: orgSlug }).returning().execute();
+
+		await tx.insert(s.orgMember).values({ orgId: org.id, userId, role: 'admin' }).execute();
+	});
+};
+
+/**
+ * Startup check: Ensures organization structure is valid.
+ * - If there are users but no organization, creates one and assigns first user as org_admin
+ * - If there are projects without an org, assigns them to the default org
+ * - If INSIGHT_DEFAULT_PROJECT_PATH is set, ensures a project exists for that path
+ */
+export const ensureOrganizationSetup = async (): Promise<void> => {
+	const firstUser = await userQueries.getFirstUser();
+	if (!firstUser) {
+		return; // No users yet, nothing to do
+	}
+
+	// Check if there's an organization
+	let org = await getFirstOrganization();
+
+	if (!org) {
+		// Create default organization
+		org = await createOrganization({
+			name: 'Default Organization',
+			slug: 'default',
+		});
+
+		// Add first user as org_admin
+		await addOrgMember({
+			orgId: org.id,
+			userId: firstUser.id,
+			role: 'admin',
+		});
+	}
+
+	// Check if first user is a member of the org
+	const membership = await getOrgMember(org.id, firstUser.id);
+	if (!membership) {
+		await addOrgMember({
+			orgId: org.id,
+			userId: firstUser.id,
+			role: 'admin',
+		});
+	}
+
+	// Assign any orphaned projects (projects without org) to the default org
+	await db.update(s.project).set({ orgId: org.id }).where(isNull(s.project.orgId)).execute();
+
+	// Ensure a project exists for the current INSIGHT_DEFAULT_PROJECT_PATH
+	await ensureDefaultProject(org);
+};
+export interface OrgMemberWithUser {
+	id: string;
+	name: string;
+	email: string;
+	role: OrgRole;
+	status: MemberStatus;
+}
+
+export interface OrgProjectWithAccess {
+	id: string;
+	name: string;
+	path: string | null;
+	role: UserRole;
+	createdAt: Date;
+	updatedAt: Date;
+}
+
+/**
+ * Everyone who can reach the organization: its members plus project-only members, who are added
+ * from a project's Users & Groups page or auto-provisioned by Slack. Both kinds consume a licensed seat.
+ */
+export const countOrgUsers = async (orgId: string): Promise<number> => {
+	const people = db.$with('org_people').as(
+		db
+			.select({ userId: s.orgMember.userId })
+			.from(s.orgMember)
+			.where(eq(s.orgMember.orgId, orgId))
+			.unionAll(
+				db
+					.select({ userId: s.projectMember.userId })
+					.from(s.projectMember)
+					.innerJoin(s.project, eq(s.projectMember.projectId, s.project.id))
+					.where(eq(s.project.orgId, orgId)),
+			),
+	);
+
+	const rows = await db
+		.with(people)
+		.select({ total: sql<number>`count(distinct ${people.userId})` })
+		.from(people);
+
+	return Number(rows[0]?.total ?? 0);
+};
+
+export const listOrgMembersWithUsers = async (orgId: string): Promise<OrgMemberWithUser[]> => {
+	const rows = await db
+		.select({
+			id: s.orgMember.userId,
+			name: s.user.name,
+			email: s.user.email,
+			role: s.orgMember.role,
+			status: userQueries.userMemberStatus,
+		})
+		.from(s.orgMember)
+		.innerJoin(s.user, eq(s.orgMember.userId, s.user.id))
+		.where(eq(s.orgMember.orgId, orgId))
+		.execute();
+	return rows;
+};
+
+export const listOrgProjectsWithAccess = async (orgId: string, userId: string): Promise<OrgProjectWithAccess[]> => {
+	const rows = await db
+		.select({
+			id: s.project.id,
+			name: s.project.name,
+			path: s.project.path,
+			role: sql<UserRole>`coalesce(${s.projectMember.role}, ${s.orgMember.role}, 'viewer')`,
+			createdAt: s.project.createdAt,
+			updatedAt: s.project.updatedAt,
+		})
+		.from(s.project)
+		.leftJoin(s.projectMember, and(eq(s.projectMember.projectId, s.project.id), eq(s.projectMember.userId, userId)))
+		.leftJoin(s.orgMember, and(eq(s.orgMember.orgId, s.project.orgId), eq(s.orgMember.userId, userId)))
+		.where(eq(s.project.orgId, orgId))
+		.orderBy(asc(s.project.name))
+		.execute();
+
+	return rows;
+};
+
+export const listOrgProjectsForContextCleanup = async (
+	orgId: string,
+	userId: string,
+): Promise<Array<{ id: string; path: string | null; role: UserRole | null }>> => {
+	return db
+		.select({
+			id: s.project.id,
+			path: s.project.path,
+			role: sql<UserRole | null>`coalesce(${s.projectMember.role}, ${s.orgMember.role})`,
+		})
+		.from(s.project)
+		.leftJoin(s.projectMember, and(eq(s.projectMember.projectId, s.project.id), eq(s.projectMember.userId, userId)))
+		.leftJoin(s.orgMember, and(eq(s.orgMember.orgId, s.project.orgId), eq(s.orgMember.userId, userId)))
+		.where(eq(s.project.orgId, orgId))
+		.execute();
+};
+
+export const updateOrgMemberRole = async (orgId: string, userId: string, role: OrgRole): Promise<void> => {
+	await db
+		.update(s.orgMember)
+		.set({ role })
+		.where(and(eq(s.orgMember.orgId, orgId), eq(s.orgMember.userId, userId)))
+		.execute();
+};
+
+export const removeOrgMember = async (orgId: string, userId: string): Promise<void> => {
+	await db
+		.delete(s.orgMember)
+		.where(and(eq(s.orgMember.orgId, orgId), eq(s.orgMember.userId, userId)))
+		.execute();
+};
+
+export const removeOrgMemberFromProjects = async (orgId: string, userId: string): Promise<void> => {
+	const projects = await db.select({ id: s.project.id }).from(s.project).where(eq(s.project.orgId, orgId)).execute();
+
+	for (const project of projects) {
+		await projectQueries.removeProjectMember(project.id, userId);
+	}
+};
+
+export const countOrgAdmins = async (orgId: string): Promise<number> => {
+	const [result] = await db
+		.select({ count: count() })
+		.from(s.orgMember)
+		.where(and(eq(s.orgMember.orgId, orgId), eq(s.orgMember.role, 'admin')))
+		.execute();
+	return result?.count ?? 0;
+};
+
+/**
+ * Ensures a project exists for the current INSIGHT_DEFAULT_PROJECT_PATH.
+ * When users change the project path and restart, the DB may not have a record for the new path.
+ */
+const ensureDefaultProject = async (org: DBOrganization): Promise<void> => {
+	const projectPath = env.INSIGHT_DEFAULT_PROJECT_PATH;
+	if (!projectPath) {
+		return;
+	}
+
+	const existing = await projectQueries.getProjectByPath(projectPath);
+	if (existing) {
+		return;
+	}
+
+	const projectName = projectPath.split('/').pop() || 'Default Project';
+	await projectQueries.createProject({
+		name: projectName,
+		type: 'local',
+		path: projectPath,
+		orgId: org.id,
+	});
+};

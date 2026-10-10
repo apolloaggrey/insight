@@ -1,0 +1,60 @@
+import { File } from 'lucide-react';
+import { ToolCallWrapper } from './tool-call-wrapper';
+import type { ToolCallComponentProps } from '.';
+import { formatBytes } from '@/lib/utils';
+import { useToolCallContext } from '@/contexts/tool-call';
+
+export const SearchToolCall = ({ toolPart: { output, input } }: ToolCallComponentProps<'search'>) => {
+	const { isSettled } = useToolCallContext();
+	const files = Array.isArray(output) ? output : output?.files || [];
+
+	if (!isSettled) {
+		return (
+			<ToolCallWrapper
+				title={
+					<>
+						Searching <code className='text-xs bg-background/50 px-1 py-0.5 rounded'>{input?.pattern}</code>
+					</>
+				}
+				children={<div className='p-4 text-center text-foreground/50 text-sm'>Searching...</div>}
+			/>
+		);
+	}
+
+	return (
+		<ToolCallWrapper
+			title={
+				<>
+					Searched <code className='text-xs bg-background/50 px-1 py-0.5 rounded'>{input?.pattern}</code>
+				</>
+			}
+			badge={files && `(${files.length} files)`}
+		>
+			{output && (
+				<div className='overflow-auto max-h-80'>
+					<div className='flex flex-col gap-0.5 py-1'>
+						{files.map((item, index) => (
+							<div
+								key={index}
+								className='flex items-center gap-2 px-2 py-1 hover:bg-background/50 rounded text-sm'
+							>
+								<File size={14} className='text-foreground/50 shrink-0' />
+								<div className='flex-1 min-w-0 flex flex-col'>
+									<span className='font-mono text-xs truncate'>{item.path}</span>
+								</div>
+								{item.size && (
+									<span className='text-xs text-foreground/40 shrink-0'>
+										{formatBytes(Number(item.size))}
+									</span>
+								)}
+							</div>
+						))}
+					</div>
+					{files.length === 0 && (
+						<div className='p-4 text-center text-foreground/50 text-sm'>No files found</div>
+					)}
+				</div>
+			)}
+		</ToolCallWrapper>
+	);
+};

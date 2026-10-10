@@ -1,0 +1,465 @@
+import { getCurrentPeriodStart, getNextPeriodStart } from '@insight/shared/date';
+import type { MemberBudgetSource } from '@insight/shared/member-budget';
+import {
+	type CalendarPeriod,
+	type LlmProvider,
+	providerKind,
+	providerLabel,
+	WARNING_BUDGET_THRESHOLD,
+} from '@insight/shared/types';
+
+import { PROVIDER_META } from '../agents/provider-meta';
+import type { BudgetNotificationKey } from '../queries/budget.queries';
+import * as budgetQueries from '../queries/budget.queries';
+import * as memberBudgetQueries from '../queries/member-budget.queries';
+import * as notificationUnsubscribeQueries from '../queries/notification-unsubscribe.queries';
+import * as projectQueries from '../queries/project.queries';
+import { emailService } from '../services/email';
+import { hasFeature, LICENSE_FEATURES } from '../services/license.service';
+import { notify } from '../services/notification.service';
+import { buildUnsubscribeUrl, resolveUnsubscribeScope } from '../services/notification-unsubscribe';
+import type { BudgetPeriod } from '../types/budget';
+import type { CustomModelMetadata } from '../types/llm';
+import { buildBudgetLimitReachedEmail } from './email-builders';
+import { BudgetExceededError } from './error';
+import type { ConfigProviderBudget } from './insight-config-llm';
+import { getProjectAvailableModels, getProjectConfigLlm, getProjectDeclaredModels } from './llm';
+import { logger } from './logger';
+import { type MemberBudgetUsage, resolveMemberBudgetUsage } from './member-budget';
+
+export type BudgetStatus = { level: 'ok' | 'warning' | 'exceeded'; message: string | null };
+
+export type BudgetSource = 'project' | 'config';
+
+export type EffectiveProviderBudget = ConfigProviderBudget & {
+	provider: LlmProvider;
+	source: BudgetSource;
+};
+
+export async function getEffectiveProviderBudgets(projectId: string): Promise<EffectiveProviderBudget[]> {
+	const [dbBudgets, configLlm] = await Promise.all([
+		budgetQueries.getProjectProviderBudgets(projectId),
+		getProjectConfigLlm(projectId),
+	]);
+
+	const byProvider = new Map<LlmProvider, EffectiveProviderBudget>();
+	for (const budget of dbBudgets) {
+		byProvider.set(budget.provider as LlmProvider, {
+			provider: budget.provider as LlmProvider,
+			limitUsd: budget.limitUsd,
+			perUserLimitUsd: budget.perUserLimitUsd ?? null,
+			period: budget.period as BudgetPeriod,
+			source: 'project',
+		});
+	}
+	for (const configured of configLlm?.providers ?? []) {
+		if (configured.budget) {
+			byProvider.set(configured.provider, {
+				provider: configured.provider,
+				limitUsd: configured.budget.limitUsd,
+				perUserLimitUsd: configured.budget.perUserLimitUsd,
+				period: configured.budget.period,
+				source: 'config',
+			});
+		}
+	}
+
+	return [...byProvider.values()];
+}
+
+/**
+ * Whether spend can be computed for each provider of a project: at least one of its active models
+ * has a token cost, either from Insight's price table or declared by an admin.
+ */
+export async function getProvidersCostSupport(projectId: string): Promise<Record<LlmProvider, boolean>> {
+	const [activeModels, declaredSources] = await Promise.all([
+		getProjectAvailableModels(projectId),
+		getProjectDeclaredModels(projectId),
+	]);
+	return Object.fromEntries(
+		declaredSources.map(({ provider }) => [
+			provider,
+			activeModels.some(
+				(model) => model.provider === provider && hasModelCost(provider, model.modelId, declaredSources),
+			),
+		]),
+	) as Record<LlmProvider, boolean>;
+}
+
+export type UnpricedModel = { provider: LlmProvider; modelId: string; name: string };
+
+export async function getUnpricedModels(projectId: string): Promise<UnpricedModel[]> {
+	const [activeModels, declaredSources] = await Promise.all([
+		getProjectAvailableModels(projectId),
+		getProjectDeclaredModels(projectId),
+	]);
+	return activeModels
+		.filter(({ provider, modelId }) => !hasModelCost(provider, modelId, declaredSources))
+		.map(({ provider, modelId, name }) => ({ provider, modelId, name }));
+}
+
+export async function checkBudgetStatus(
+	projectId: string,
+	provider: LlmProvider,
+	userId?: string,
+): Promise<BudgetStatus> {
+	const [resolved, memberUsage] = await Promise.all([
+		resolveBudgetUsages(projectId, provider, userId),
+		userId ? resolveMemberBudgetUsage(projectId, userId) : null,
+	]);
+
+	const candidates = (resolved?.usages ?? []).map((usage) => ({
+		ratio: usage.ratio,
+		message: buildBudgetMessage(usage.ratio, providerLabel(provider), usage.resetLabel, usage.scope),
+	}));
+	if (memberUsage) {
+		candidates.push({ ratio: memberUsage.ratio, message: buildMemberBudgetMessage(memberUsage) });
+	}
+
+	const alerting = candidates.filter((candidate) => candidate.ratio >= WARNING_BUDGET_THRESHOLD);
+	if (alerting.length === 0) {
+		return { level: 'ok', message: null };
+	}
+
+	const worst = alerting.reduce((highest, candidate) => (candidate.ratio > highest.ratio ? candidate : highest));
+	return { level: worst.ratio >= 1 ? 'exceeded' : 'warning', message: worst.message };
+}
+
+export async function assertBudgetNotExceeded(
+	projectId: string,
+	provider: LlmProvider,
+	userId?: string,
+): Promise<void> {
+	const exceededMemberUsage = userId ? await notifyIfMemberBudgetExceeded(projectId, userId) : null;
+	await assertProviderBudgetNotExceeded(projectId, provider, userId);
+	if (exceededMemberUsage) {
+		throw new BudgetExceededError(buildMemberBudgetMessage(exceededMemberUsage));
+	}
+}
+
+/** Notifies before any limit throws, so a member over budget is told even when a provider cap blocks first. */
+async function notifyIfMemberBudgetExceeded(projectId: string, userId: string): Promise<MemberBudgetUsage | null> {
+	const usage = await resolveMemberBudgetUsage(projectId, userId);
+	if (!usage || usage.ratio < 1) {
+		return null;
+	}
+	await notifyMemberOnBudgetLimitReached(projectId, userId, usage);
+	return usage;
+}
+
+async function assertProviderBudgetNotExceeded(
+	projectId: string,
+	provider: LlmProvider,
+	userId?: string,
+): Promise<void> {
+	const resolved = await resolveBudgetUsages(projectId, provider, userId);
+	if (!resolved) {
+		return;
+	}
+
+	void notifyOnExceededBudgets(projectId, resolved, userId).catch((error) =>
+		logger.error(`Failed to send budget limit notification: ${String(error)}`, { source: 'system' }),
+	);
+
+	const projectUsage = resolved.usages.find((u) => u.scope === 'project');
+	const userUsage = resolved.usages.find((u) => u.scope === 'user');
+
+	if (projectUsage && projectUsage.ratio >= 1) {
+		throw new BudgetExceededError(
+			buildBudgetMessage(projectUsage.ratio, providerLabel(provider), projectUsage.resetLabel, 'project'),
+		);
+	}
+
+	if (userUsage && userUsage.ratio >= 1 && userId) {
+		throw new BudgetExceededError(
+			buildBudgetMessage(userUsage.ratio, providerLabel(provider), userUsage.resetLabel, 'user'),
+		);
+	}
+}
+
+async function notifyOnExceededBudgets(
+	projectId: string,
+	resolved: ResolvedBudget,
+	userId: string | undefined,
+): Promise<void> {
+	const { budget, usages, periodStart } = resolved;
+	const projectUsage = usages.find((u) => u.scope === 'project');
+	const userUsage = usages.find((u) => u.scope === 'user');
+
+	if (projectUsage && projectUsage.ratio >= 1) {
+		await notifyAdminsOnBudgetLimitReached(
+			projectId,
+			budget,
+			projectUsage.currentSpend,
+			projectUsage.resetLabel,
+			periodStart,
+		);
+	}
+
+	if (userUsage && userUsage.ratio >= 1 && userId) {
+		await notifyUserOnBudgetLimitReached(
+			projectId,
+			userId,
+			budget,
+			userUsage.currentSpend,
+			userUsage.resetLabel,
+			periodStart,
+		);
+	}
+}
+
+type BudgetUsage = {
+	currentSpend: number;
+	ratio: number;
+	resetLabel: string;
+	scope: 'project' | 'user';
+};
+
+type ResolvedBudget = {
+	budget: EffectiveProviderBudget;
+	usages: BudgetUsage[];
+	/** Period start captured at resolution time; carried through so a delayed notify can't claim a later period. */
+	periodStart: Date;
+};
+
+function hasModelCost(
+	provider: LlmProvider,
+	modelId: string,
+	declaredSources: Array<{ provider: LlmProvider; models: CustomModelMetadata[] }>,
+): boolean {
+	const builtInModel = PROVIDER_META[providerKind(provider)].models.find((model) => model.id === modelId);
+	const declaredModel = declaredSources
+		.find((source) => source.provider === provider)
+		?.models.find((model) => model.id === modelId);
+	return builtInModel?.costPerM !== undefined || (declaredModel !== undefined && hasDeclaredCosts(declaredModel));
+}
+
+function hasDeclaredCosts(model: CustomModelMetadata): boolean {
+	return Object.values(model.costPerM ?? {}).some((cost) => cost !== undefined);
+}
+
+function buildBudgetMessage(ratio: number, label: string, resetLabel: string, scope: 'project' | 'user'): string {
+	const percent = Math.min(Math.round(ratio * 100), 100);
+	const scopeLabel = scope === 'user' ? `your personal ${label}` : `your ${label}`;
+	return `You've used ${percent}% of ${scopeLabel} budget. It will reset ${resetLabel}.`;
+}
+
+const MEMBER_BUDGET_SCOPE_LABELS: Record<MemberBudgetSource, string> = {
+	personal: 'your personal budget',
+	group: 'your user group budget',
+	default: 'the default member budget',
+};
+
+function buildMemberBudgetMessage(usage: MemberBudgetUsage): string {
+	const percent = Math.min(Math.round(usage.ratio * 100), 100);
+	const scopeLabel = MEMBER_BUDGET_SCOPE_LABELS[usage.source];
+	const resetLabel = formatResetDate(usage.resetsAt, usage.period);
+	return `You've used ${percent}% of ${scopeLabel} for this ${usage.period}. It will reset ${resetLabel}.`;
+}
+
+async function resolveBudgetUsages(
+	projectId: string,
+	provider: LlmProvider,
+	userId: string | undefined,
+): Promise<ResolvedBudget | null> {
+	const budgets = await getEffectiveProviderBudgets(projectId);
+	const budget = budgets.find((b) => b.provider === provider);
+	if (!budget) {
+		return null;
+	}
+
+	const hasProjectLimit = budget.limitUsd > 0;
+	const hasUserLimit =
+		!!userId &&
+		!!budget.perUserLimitUsd &&
+		budget.perUserLimitUsd > 0 &&
+		(await hasFeature(LICENSE_FEATURES.userBudget));
+
+	const periodStart = getCurrentPeriodStart(budget.period);
+	if (!hasProjectLimit && !hasUserLimit) {
+		return { budget, usages: [], periodStart };
+	}
+
+	if (budget.source === 'project') {
+		await budgetQueries.advanceStaleBudgetPeriods(projectId, provider);
+	}
+	const { projectSpend, userSpend } = await budgetQueries.getProviderBudgetSpend(
+		projectId,
+		provider,
+		budget.period,
+		userId,
+		periodStart,
+	);
+	const resetLabel = formatResetDate(getNextPeriodStart(budget.period), budget.period);
+
+	const usages: BudgetUsage[] = [];
+	if (hasProjectLimit) {
+		usages.push({
+			currentSpend: projectSpend,
+			ratio: projectSpend / budget.limitUsd,
+			resetLabel,
+			scope: 'project',
+		});
+	}
+	if (hasUserLimit && budget.perUserLimitUsd) {
+		usages.push({
+			currentSpend: userSpend,
+			ratio: userSpend / budget.perUserLimitUsd,
+			resetLabel,
+			scope: 'user',
+		});
+	}
+	return { budget, usages, periodStart };
+}
+
+async function notifyAdminsOnBudgetLimitReached(
+	projectId: string,
+	budget: EffectiveProviderBudget,
+	currentSpendUsd: number,
+	resetLabel: string,
+	periodStart: Date,
+): Promise<void> {
+	const key = budgetNotificationKey(projectId, budget, 'project', periodStart);
+	if (!(await budgetQueries.claimBudgetNotification(key))) {
+		return;
+	}
+
+	const allMembers = await projectQueries.listProjectMembersWithRoles(projectId);
+	const admins = allMembers.filter((m) => m.role === 'admin');
+	if (admins.length === 0) {
+		await budgetQueries.releaseBudgetNotification(key).catch(() => {});
+		return;
+	}
+
+	const label = providerLabel(budget.provider);
+
+	try {
+		if (emailService.isEnabled()) {
+			await Promise.all(
+				admins.map(async (admin) => {
+					const scope = resolveUnsubscribeScope('email', 'budget');
+					if (scope && (await notificationUnsubscribeQueries.isUnsubscribed(admin.id, scope))) {
+						return;
+					}
+					await emailService.sendEmail(
+						admin.email,
+						await buildBudgetLimitReachedEmail(
+							admin,
+							label,
+							budget.limitUsd,
+							currentSpendUsd,
+							budget.period,
+							resetLabel,
+							scope ? buildUnsubscribeUrl(admin.id, scope) : undefined,
+						),
+					);
+				}),
+			);
+		}
+
+		await Promise.all(
+			admins.map((admin) =>
+				notify({
+					userId: admin.id,
+					projectId,
+					category: 'budget',
+					title: `${label} budget limit reached`,
+					body: `Chat requests using ${label} are blocked until the budget resets ${resetLabel}.`,
+					linkUrl: '/settings/project/budgets',
+					channels: ['in_app'],
+					payload: {
+						provider: budget.provider,
+						limitUsd: budget.limitUsd,
+						currentSpendUsd,
+						scope: 'project',
+					},
+				}),
+			),
+		);
+	} catch (error) {
+		await budgetQueries.releaseBudgetNotification(key).catch(() => {});
+		logger.error(`Failed to send budget limit notification: ${String(error)}`, { source: 'system' });
+	}
+}
+
+async function notifyUserOnBudgetLimitReached(
+	projectId: string,
+	userId: string,
+	budget: EffectiveProviderBudget,
+	currentSpendUsd: number,
+	resetLabel: string,
+	periodStart: Date,
+): Promise<void> {
+	const key = budgetNotificationKey(projectId, budget, `user:${userId}`, periodStart);
+	if (!(await budgetQueries.claimBudgetNotification(key))) {
+		return;
+	}
+
+	const label = providerLabel(budget.provider);
+
+	try {
+		await notify({
+			userId,
+			projectId,
+			category: 'budget',
+			title: `Your ${label} budget limit reached`,
+			body: `Your personal ${label} budget is used up. Requests are blocked until it resets ${resetLabel}.`,
+			linkUrl: '/settings/project/budgets',
+			channels: ['in_app'],
+			payload: { provider: budget.provider, limitUsd: budget.perUserLimitUsd, currentSpendUsd, scope: 'user' },
+		});
+	} catch (error) {
+		await budgetQueries.releaseBudgetNotification(key).catch(() => {});
+		logger.error(`Failed to send per-user budget limit notification: ${String(error)}`, { source: 'system' });
+	}
+}
+
+async function notifyMemberOnBudgetLimitReached(
+	projectId: string,
+	userId: string,
+	usage: MemberBudgetUsage,
+): Promise<void> {
+	const periodStart = getCurrentPeriodStart(usage.period);
+	if (!(await memberBudgetQueries.claimMemberBudgetNotification(projectId, userId, periodStart))) {
+		return;
+	}
+
+	const resetLabel = formatResetDate(usage.resetsAt, usage.period);
+	try {
+		await notify({
+			userId,
+			projectId,
+			category: 'budget',
+			title: 'Your budget limit reached',
+			body: `You've used all of ${MEMBER_BUDGET_SCOPE_LABELS[usage.source]}. Requests are blocked until it resets ${resetLabel}.`,
+			linkUrl: '/settings/project/budgets',
+			channels: ['in_app'],
+			payload: { limitUsd: usage.limitUsd, currentSpendUsd: usage.spendUsd, scope: 'member' },
+		});
+	} catch (error) {
+		await memberBudgetQueries.releaseMemberBudgetNotification(projectId, userId, periodStart).catch(() => {});
+		logger.error(`Failed to send member budget limit notification: ${String(error)}`, { source: 'system' });
+	}
+}
+
+function budgetNotificationKey(
+	projectId: string,
+	budget: EffectiveProviderBudget,
+	scope: string,
+	periodStart: Date,
+): BudgetNotificationKey {
+	return {
+		projectId,
+		provider: budget.provider,
+		scope,
+		periodStart,
+	};
+}
+
+function formatResetDate(date: Date, period: CalendarPeriod): string {
+	if (period === 'day') {
+		return 'tomorrow';
+	}
+	const year = period === 'year' ? 'numeric' : undefined;
+	return `on ${date.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year, timeZone: 'UTC' })}`;
+}

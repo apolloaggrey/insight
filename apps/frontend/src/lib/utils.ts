@@ -1,0 +1,45 @@
+import { clsx } from 'clsx';
+import { twMerge } from 'tailwind-merge';
+import type { ClassValue } from 'clsx';
+
+export function cn(...inputs: Array<ClassValue>) {
+	return twMerge(clsx(inputs));
+}
+
+/** Add tailwind classes to hide/show an element based on a condition by changing the opacity and visibility */
+export function hideIf(condition: boolean): string {
+	return condition ? 'opacity-0 invisible' : 'opacity-100 visible';
+}
+
+export function formatBytes(bytes: number): string {
+	if (bytes === 0) {
+		return '0 B';
+	}
+	const k = 1024;
+	const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+	const i = Math.floor(Math.log(bytes) / Math.log(k));
+	const value = bytes / Math.pow(k, i);
+	return `${value % 1 === 0 ? value : value.toFixed(1)} ${sizes[i]}`;
+}
+
+export function capitalize(str: string): string {
+	return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+export function isLast<T>(item: T, array: T[]): boolean {
+	return item === array.at(-1);
+}
+
+export function toLocalDateString(d: Date): string {
+	const y = d.getFullYear();
+	const m = String(d.getMonth() + 1).padStart(2, '0');
+	const day = String(d.getDate()).padStart(2, '0');
+	return `${y}-${m}-${day}`;
+}
+
+export function toUtcDateString(d: Date): string {
+	const y = d.getUTCFullYear();
+	const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+	const day = String(d.getUTCDate()).padStart(2, '0');
+	return `${y}-${m}-${day}`;
+}

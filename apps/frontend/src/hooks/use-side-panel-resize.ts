@@ -1,0 +1,129 @@
+import { useCallback, useEffect, useRef } from 'react';
+
+import { useResizeObserver } from './use-resize-observer';
+import {
+	CHAT_PANEL_MIN_WIDTH,
+	loadPersistedWidthRatio,
+	SIDE_PANEL_MIN_WIDTH,
+	SIDE_PANEL_WIDTH_STORAGE_KEY,
+} from '@/lib/side-panel';
+
+function persistRatio(ratio: number) {
+	try {
+		localStorage.setItem(SIDE_PANEL_WIDTH_STORAGE_KEY, String(ratio));
+	} catch {
+		/* localStorage unavailable */
+	}
+}
+
+/** Handles the manual resize of the side panel */
+export const useSidePanelResize = (
+	sidePanelRef: React.RefObject<HTMLDivElement | null>,
+	containerRef: React.RefObject<HTMLDivElement | null>,
+	resizeHandleRef: React.RefObject<HTMLDivElement | null>,
+	enabled: boolean,
+	chatPanelMinWidth: number = CHAT_PANEL_MIN_WIDTH,
+) => {
+	const ratioRef = useRef(loadPersistedWidthRatio());
+	const rafRef = useRef(0);
+	const chatPanelMinWidthRef = useRef(chatPanelMinWidth);
+	chatPanelMinWidthRef.current = chatPanelMinWidth;
+
+	useEffect(() => {
+		if (!enabled) {
+			return;
+		}
+
+		const resizeHandle = resizeHandleRef.current;
+		const sidePanel = sidePanelRef.current;
+		if (!resizeHandle || !sidePanel) {
+			return;
+		}
+
+		let startX = 0;
+		let startWidth = 0;
+
+		const handleMouseMove = (e: MouseEvent) => {
+			cancelAnimationFrame(rafRef.current);
+			rafRef.current = requestAnimationFrame(() => {
+				const deltaX = e.clientX - startX;
+				const width = clampWidth(startWidth - deltaX, containerRef.current, chatPanelMinWidthRef.current);
+				sidePanel.style.transitionDuration = '0ms';
+				sidePanel.style.width = `${width}px`;
+			});
+		};
+
+		const handleMouseUp = () => {
+			cancelAnimationFrame(rafRef.current);
+			document.removeEventListener('mousemove', handleMouseMove);
+			document.removeEventListener('mouseup', handleMouseUp);
+			document.body.style.cursor = 'default';
+			setIframesPointerEvents('');
+
+			const container = containerRef.current;
+			if (container) {
+				const sidePanelWidth = sidePanel.getBoundingClientRect().width;
+				const containerWidth = container.getBoundingClientRect().width;
+				ratioRef.current = sidePanelWidth / containerWidth;
+				persistRatio(ratioRef.current);
+			}
+		};
+
+		const handleMouseDown = (e: MouseEvent) => {
+			e.preventDefault();
+			e.stopPropagation();
+			startX = e.clientX;
+			startWidth = sidePanel.getBoundingClientRect().width || 0;
+			document.body.style.cursor = 'ew-resize';
+			setIframesPointerEvents('none');
+			document.addEventListener('mousemove', handleMouseMove);
+			document.addEventListener('mouseup', handleMouseUp);
+		};
+
+		resizeHandle.addEventListener('mousedown', handleMouseDown);
+		return () => {
+			resizeHandle.removeEventListener('mousedown', handleMouseDown);
+			document.removeEventListener('mousemove', handleMouseMove);
+			document.removeEventListener('mouseup', handleMouseUp);
+			setIframesPointerEvents('');
+			cancelAnimationFrame(rafRef.current);
+		};
+	}, [enabled, sidePanelRef, containerRef, resizeHandleRef]);
+
+	const enabledRef = useRef(enabled);
+	enabledRef.current = enabled;
+
+	const applyPersistedWidth = useCallback(() => {
+		if (!enabledRef.current) {
+			return;
+		}
+
+		const container = containerRef.current;
+		const sidePanel = sidePanelRef.current;
+		if (!container || !sidePanel) {
+			return;
+		}
+
+		const containerWidth = container.getBoundingClientRect().width;
+		const width = clampWidth(Math.floor(ratioRef.current * containerWidth), container, chatPanelMinWidth);
+		sidePanel.style.width = `${width}px`;
+		sidePanel.style.transitionDuration = '0ms';
+	}, [containerRef, sidePanelRef, chatPanelMinWidth]);
+
+	useResizeObserver(containerRef, applyPersistedWidth, [applyPersistedWidth]);
+
+	return { ratioRef };
+};
+
+function clampWidth(width: number, container: HTMLElement | null, chatPanelMinWidth: number): number {
+	const containerWidth = container?.getBoundingClientRect().width ?? Infinity;
+	const maxWidth = Math.max(SIDE_PANEL_MIN_WIDTH, containerWidth - chatPanelMinWidth);
+	return Math.min(Math.max(width, SIDE_PANEL_MIN_WIDTH), maxWidth);
+}
+
+/** Iframes swallow mouse events, which would break the drag when the cursor moves over one */
+function setIframesPointerEvents(value: '' | 'none') {
+	document.querySelectorAll('iframe').forEach((iframe) => {
+		iframe.style.pointerEvents = value;
+	});
+}
