@@ -74,10 +74,10 @@ def test_threads_can_be_loaded_from_config(tmp_path):
     assert config.threads == 4
 
 
-def test_default_example_config_only_contains_duckdb(repo_root):
+def test_default_example_config_has_no_databases(repo_root):
     config = InsightConfig.load(repo_root / "example")
 
-    assert [database.name for database in config.databases] == ["duckdb-jaffle-shop"]
+    assert config.databases == []
 
 
 def test_save_preserves_metabase_api_key(tmp_path):

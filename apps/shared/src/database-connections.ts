@@ -1,6 +1,14 @@
 /* Insight: database connections managed from the web app. Apache-2.0. */
 
-export type ConnectionFieldKind = 'text' | 'number' | 'password' | 'textarea' | 'json' | 'boolean' | 'select';
+export type ConnectionFieldKind =
+	| 'text'
+	| 'number'
+	| 'password'
+	| 'textarea'
+	| 'json'
+	| 'boolean'
+	| 'select'
+	| 'certificate';
 
 export interface ConnectionField {
 	key: string;
@@ -49,17 +57,31 @@ const schema: ConnectionField = {
 	help: 'Leave empty to make every schema available.',
 };
 
-const serverDatabase = (id: string, label: string, engine: string, defaultPort: number): ConnectionType => ({
+const sslCertificate: ConnectionField = {
+	key: 'ssl_ca',
+	label: 'SSL CA certificate',
+	kind: 'certificate',
+	secret: true,
+	help: 'Optional. Upload the PEM file from your provider to verify the server. Connections then require TLS.',
+};
+
+const serverDatabase = (
+	id: string,
+	label: string,
+	engine: string,
+	defaultPort: number,
+	extraFields: ConnectionField[] = [],
+): ConnectionType => ({
 	id,
 	label,
 	engine,
 	popular: true,
-	fields: [host(), port(defaultPort), database, user, password(), schema],
+	fields: [host(), port(defaultPort), database, user, password(), schema, ...extraFields],
 });
 
 export const CONNECTION_TYPES: ConnectionType[] = [
 	serverDatabase('postgres', 'PostgreSQL', 'postgres', 5432),
-	serverDatabase('mysql', 'MySQL', 'mysql', 3306),
+	serverDatabase('mysql', 'MySQL', 'mysql', 3306, [sslCertificate]),
 	serverDatabase('mssql', 'SQL Server', 'mssql', 1433),
 	{
 		id: 'oracle',
@@ -90,7 +112,7 @@ export const CONNECTION_TYPES: ConnectionType[] = [
 			},
 		],
 	},
-	serverDatabase('mariadb', 'MariaDB', 'mysql', 3306),
+	serverDatabase('mariadb', 'MariaDB', 'mysql', 3306, [sslCertificate]),
 	{
 		id: 'snowflake',
 		label: 'Snowflake',

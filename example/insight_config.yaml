@@ -1,24 +1,7 @@
 project_name: example
-databases:
-- name: duckdb-jaffle-shop
-  templates:
-  - columns
-  - preview
-  profiling:
-    refresh_policy: interval
-    interval_days: 1
-  include: []
-  exclude: []
-  type: duckdb
-  path: ./jaffle_shop.duckdb
-repos:
-- name: dbt
-  url: https://github.com/dbt-labs/jaffle_shop_duckdb.git
-  branch: null
-semantic_layer:
-  type: metricflow
-  manifest_path: ./repos/dbt/target/semantic_manifest.json
-  database: duckdb-jaffle-shop
+databases: []
+repos: []
+semantic_layer: null
 notion: null
 obsidian: null
 llm: null

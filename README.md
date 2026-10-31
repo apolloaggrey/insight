@@ -46,6 +46,10 @@ insight chat --port 5005  # the chat app; DB_URI=sqlite:/abs/path/app.sqlite kee
 
 The CLI is `insight`, each project is configured in `insight_config.yaml`, and the server's environment variables start with `INSIGHT_`.
 
+## Web access
+
+The agent can browse the web through [Obscura](https://github.com/h4ckf0r0day/obscura), a headless browser connected as an MCP server by default. The Docker image includes it. For `insight chat`, put the `obscura` binary on your `PATH`; without it the server is simply left out. Admins can turn it off per project in Settings → Project → MCP, and declaring `obscura` in `agent/mcps/mcp.json` replaces the default. It is not available in cloud mode, which only allows HTTP MCP servers.
+
 ## Tests
 
 The upstream test suites are kept, and the rebuilt features pass the upstream Apache-licensed tests for them.
@@ -61,7 +65,3 @@ Results as of the fork:
     - `sandbox-runtime` needs Linux. It fails the same way upstream on macOS.
     - Two heavy suites can time out at 5 seconds under full parallel load. They pass when run alone.
 - **Frontend:** 702 of 702 tests pass.
-
-## How it is wired into Palasy
-
-`backend/app/analytics.py` in the Palasy repo signs each Palasy user in to Insight automatically and keeps their role in step, so nobody signs in twice. `analytics/snapshot.py` builds the DuckDB copy of the Palasy database the agent reads, leaving out secrets and personal identifiers.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import cache
+from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field
@@ -67,6 +69,7 @@ class MysqlConfig(DatabaseConfig):
     user: str = Field(description="Username")
     password: str = Field(description="Password")
     schema_name: str | None = Field(default=None, description="Default schema (optional)")
+    ssl_ca: str | None = Field(default=None, description="PEM-encoded CA certificate; verifies the server (optional)")
 
     @classmethod
     def promptConfig(cls) -> "MysqlConfig":
@@ -100,12 +103,14 @@ class MysqlConfig(DatabaseConfig):
         require_database_backend("mysql")
         import ibis
 
+        ssl_options = {"ssl": {"ca": _ca_file(self.ssl_ca).name}, "ssl_mode": "VERIFY_CA"} if self.ssl_ca else {}
         return ibis.mysql.connect(
             host=self.host,
             port=self.port,
             database=self.database,
             user=self.user,
             password=self.password,
+            **ssl_options,
         )
 
     def get_database_name(self) -> str:
@@ -140,3 +145,12 @@ class MysqlConfig(DatabaseConfig):
         finally:
             if conn is not None:
                 conn.disconnect()
+
+
+@cache
+def _ca_file(pem: str):
+    """MySQLdb only reads the CA from a path; the file lives with the process so ibis can reconnect."""
+    file = NamedTemporaryFile("w", suffix=".crt")
+    file.write(pem)
+    file.flush()
+    return file

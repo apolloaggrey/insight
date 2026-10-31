@@ -209,6 +209,11 @@ function normalizeValue(field: ConnectionField, raw: ConnectionValues[string]): 
 				throw new HandlerError('BAD_REQUEST', `${field.label} must be one of ${field.options.join(', ')}.`);
 			}
 			return String(raw);
+		case 'certificate':
+			if (!String(raw).includes('-----BEGIN CERTIFICATE-----')) {
+				throw new HandlerError('BAD_REQUEST', `${field.label} must be a PEM certificate file.`);
+			}
+			return String(raw).trim();
 		default:
 			return String(raw).trim();
 	}

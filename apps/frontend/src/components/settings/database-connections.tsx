@@ -369,6 +369,24 @@ function ConnectionFieldInput(props: {
 			</FieldRow>
 		);
 	}
+	if (field.kind === 'certificate') {
+		return (
+			<FieldRow
+				id={id}
+				label={field.label}
+				help={isStored ? 'Stored — choose a file to replace it.' : field.help}
+			>
+				<Input
+					id={id}
+					type='file'
+					accept='.crt,.pem,.cer'
+					onChange={(event) => {
+						void event.target.files?.[0]?.text().then(props.onChange);
+					}}
+				/>
+			</FieldRow>
+		);
+	}
 	if (field.kind === 'textarea' || field.kind === 'json') {
 		return (
 			<FieldRow id={id} label={field.label} help={field.help}>

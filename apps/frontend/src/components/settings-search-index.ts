@@ -1126,6 +1126,8 @@ export const settingsSearchIndex: SettingsSearchEntry[] = [
 			'oracle',
 			'sqlite',
 			'mariadb',
+			'ssl',
+			'certificate',
 			'snowflake',
 			'bigquery',
 			'redshift',

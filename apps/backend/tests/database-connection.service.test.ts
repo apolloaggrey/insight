@@ -81,6 +81,28 @@ describe('database connections', () => {
 		);
 	});
 
+	it('stores an uploaded CA certificate as a secret and rejects anything else', async () => {
+		const pem = '-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n';
+		const view = await service.createConnection('p1', 'u1', {
+			name: 'do',
+			typeId: 'mysql',
+			values: { ...postgresValues, ssl_ca: pem },
+		});
+
+		expect(view.storedSecrets).toContain('ssl_ca');
+		expect(readFileSync(path.join(state.projectPath, service.MANAGED_CONNECTIONS_FILE), 'utf8')).toContain(
+			"ssl_ca: {{ env('INSIGHT_CONN_ID1_SSL_CA') }}",
+		);
+		expect((await service.getRuntimeEnvVars('p1')).INSIGHT_CONN_ID1_SSL_CA).toBe(JSON.stringify(pem.trim()));
+		await expect(
+			service.createConnection('p1', 'u1', {
+				name: 'bad',
+				typeId: 'mysql',
+				values: { ...postgresValues, ssl_ca: 'not a certificate' },
+			}),
+		).rejects.toThrow('must be a PEM certificate');
+	});
+
 	it('rejects missing required fields, bad names, duplicates and invalid JSON', async () => {
 		await expect(
 			service.createConnection('p1', 'u1', {

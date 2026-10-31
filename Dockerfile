@@ -103,6 +103,17 @@ RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
+# Obscura headless browser, connected to the agent by default as an MCP server.
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) arch=x86_64; sha=2116764b99bc084fae3668b68aa535b4cf456e4498845b47493ad4123e83ca36 ;; \
+        arm64) arch=aarch64; sha=24c549a348b1d464e80aa3f643bc0c874b0a2942fb7836c683528028d0fbb190 ;; \
+        *) echo "Unsupported architecture for Obscura" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /tmp/obscura.tar.gz "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.5/obscura-$arch-linux.tar.gz" \
+    && echo "$sha  /tmp/obscura.tar.gz" | sha256sum -c - \
+    && tar xzf /tmp/obscura.tar.gz --no-same-owner -C /usr/local/bin obscura \
+    && rm /tmp/obscura.tar.gz
+
 # Create non-root user and required directories
 RUN useradd -m -s /bin/bash insight \
     && mkdir -p /var/log/supervisor /app/context /app/projects /app/storage \

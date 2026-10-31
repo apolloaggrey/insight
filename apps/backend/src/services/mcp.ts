@@ -9,7 +9,7 @@ import Ajv2020 from 'ajv/dist/2020';
 import { existsSync, watch } from 'fs';
 import { mkdir, readdir, readFile, unlink, writeFile } from 'fs/promises';
 import { createRuntime, type Runtime, ServerDefinition } from 'mcporter';
-import { isAbsolute, join, relative, resolve, sep } from 'path';
+import { delimiter, isAbsolute, join, relative, resolve, sep } from 'path';
 
 import { isCloud } from '../env';
 import {
@@ -32,6 +32,7 @@ import { buildMcpOpenApiDocument, extractToolsFromOpenApi, type McpToolDefinitio
 const HTTP_TRANSPORTS = ['streamable-http', 'sse', 'http'];
 const MCPS_DIR = ['agent', 'mcps'];
 const GITIGNORE_CONTENT = '# insight: discovered MCP tool specs (generated at runtime)\n*/\n';
+const OBSCURA_COMMAND = 'obscura';
 
 type DisabledSets = { servers: Set<string>; tools: Set<string> };
 
@@ -74,6 +75,24 @@ function formatSchemaError(error: ErrorObject): string {
 			? ` (\`${error.params.additionalProperty}\`)`
 			: '';
 	return `${where} ${error.message ?? 'is invalid'}${extra}`;
+}
+
+/**
+ * Servers every project gets without declaring them. Obscura gives the agent web access; it is
+ * stdio-only, so it is left out in cloud mode and wherever its binary is not installed. A project
+ * replaces it by declaring `obscura` in `mcp.json`, and admins can disable it like any other server.
+ */
+function getDefaultMcpServers(): Record<string, McpServerConfig> {
+	if (isCloud || !isCommandOnPath(OBSCURA_COMMAND)) {
+		return {};
+	}
+	return { [OBSCURA_COMMAND]: { command: OBSCURA_COMMAND, args: ['mcp'] } };
+}
+
+function isCommandOnPath(command: string): boolean {
+	return (process.env.PATH ?? '')
+		.split(delimiter)
+		.some((directory) => directory && existsSync(join(directory, command)));
 }
 
 function isWithinDirectory(base: string, target: string): boolean {
@@ -564,10 +583,13 @@ export class McpService {
 	}
 
 	private async _loadConfig(): Promise<void> {
+		this._mcpServers = { ...getDefaultMcpServers(), ...(await this._readDeclaredServers()) };
+	}
+
+	private async _readDeclaredServers(): Promise<Record<string, McpServerConfig>> {
 		if (!this._mcpJsonFilePath || !existsSync(this._mcpJsonFilePath)) {
-			this._mcpServers = {};
 			this._configError = null;
-			return;
+			return {};
 		}
 
 		try {
@@ -575,8 +597,8 @@ export class McpService {
 			const envVars = this._projectId ? await getEnvVars(this._projectId) : {};
 			const resolved = resolveConfigEnvVars(JSON.parse(fileContent), envVars);
 			const parsed = mcpJsonSchema.parse(resolved);
-			this._mcpServers = parsed.mcpServers;
 			this._configError = null;
+			return parsed.mcpServers;
 		} catch (error) {
 			this._configError = this._formatConfigError(error);
 			logger.error(`MCP config parse failed: ${this._mcpJsonFilePath}`, {
@@ -584,7 +606,7 @@ export class McpService {
 				projectId: this._projectId ?? undefined,
 				context: { error: String(error) },
 			});
-			this._mcpServers = {};
+			return {};
 		}
 	}
 

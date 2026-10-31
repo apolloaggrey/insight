@@ -8,7 +8,7 @@ import * as projectQueries from '../src/queries/project.queries';
 
 const PASSWORD = 'password';
 const EXAMPLE_PROJECT_PATH = path.resolve(import.meta.dirname, '../../../example');
-const EXAMPLE_PROJECT_NAME = 'Jaffle Shop';
+const EXAMPLE_PROJECT_NAME = 'Example';
 
 const USERS = [
 	{ email: 'admin@company1.com', name: 'Admin Company1' },

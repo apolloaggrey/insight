@@ -459,3 +459,12 @@ describe('SystemPrompt display_map rules', () => {
 		);
 	});
 });
+
+describe('web browser MCP guidance', () => {
+	it('tells the agent it has internet access only when obscura is enabled', () => {
+		const render = (mcpServers: string[]) => renderToMarkdown(SystemPrompt({ mcpServers }));
+
+		expect(render(['notion', 'obscura'])).toContain('gives you internet access');
+		expect(render(['notion'])).not.toContain('gives you internet access');
+	});
+});
