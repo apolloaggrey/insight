@@ -345,8 +345,8 @@ function GitSettingsPage() {
 														Otherwise ask your admin.
 													</p>
 													<p>
-														After setting the server keys, redeploy or restart Insight for them
-														to take effect.
+														After setting the server keys, redeploy or restart Insight for
+														them to take effect.
 													</p>
 													<p>Documentation link coming soon.</p>
 												</div>

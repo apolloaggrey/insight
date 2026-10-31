@@ -148,7 +148,10 @@ export const organizationRoutes = {
 		.input(z.object({ userId: z.string() }))
 		.mutation(async ({ input, ctx }) => {
 			if (isCloud) {
-				throw new TRPCError({ code: 'FORBIDDEN', message: 'Admin password resets are disabled in Insight cloud.' });
+				throw new TRPCError({
+					code: 'FORBIDDEN',
+					message: 'Admin password resets are disabled in Insight cloud.',
+				});
 			}
 
 			const memberRole = await orgQueries.getUserRoleInOrg(ctx.org.id, input.userId);

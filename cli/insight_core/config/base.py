@@ -16,10 +16,10 @@ if TYPE_CHECKING:
 from insight_core.ui import UI, ask_confirm, ask_select
 
 from .confluence import ConfluenceConfig
-from .managed_connections import merge_managed_connections
 from .databases import DATABASE_CONFIG_CLASSES, AnyDatabaseConfig, DatabaseTemplate, DatabaseType, parse_database_config
 from .error_handler import format_all_validation_errors
 from .llm import LLMConfig
+from .managed_connections import merge_managed_connections
 from .mcp import McpConfig
 from .metabase import MetabaseConfig
 from .notion import NotionConfig

@@ -8,12 +8,12 @@
 
 ### Services overview
 
-| Service                    | Port | Command                | Notes                                                                                                    |
-| -------------------------- | ---- | ---------------------- | -------------------------------------------------------------------------------------------------------- |
-| Backend (Fastify/tRPC/Bun) | 5005 | `npm run dev:backend`  | Uses `bun --watch` for hot reload                                                                        |
-| Frontend (Vite/React)      | 3000 | `npm run dev:frontend` | Vite HMR                                                                                                 |
+| Service                    | Port | Command                | Notes                                                                                                            |
+| -------------------------- | ---- | ---------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Backend (Fastify/tRPC/Bun) | 5005 | `npm run dev:backend`  | Uses `bun --watch` for hot reload                                                                                |
+| Frontend (Vite/React)      | 3000 | `npm run dev:frontend` | Vite HMR                                                                                                         |
 | FastAPI (Python sidecar)   | 8005 | `npm run dev:fastapi`  | Requires `INSIGHT_DEFAULT_PROJECT_PATH` to point to a valid Insight project folder; optional for core UI testing |
-| All three together         | —    | `npm run dev`          | Runs all via `npm-run-all`; will fail if FastAPI project path is missing                                 |
+| All three together         | —    | `npm run dev`          | Runs all via `npm-run-all`; will fail if FastAPI project path is missing                                         |
 
 ### Running the app
 

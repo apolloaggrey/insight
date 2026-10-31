@@ -20,7 +20,10 @@ export const accountRoutes = {
 		)
 		.mutation(async ({ input, ctx }) => {
 			if (isCloud) {
-				throw new TRPCError({ code: 'FORBIDDEN', message: 'Admin password resets are disabled in Insight cloud.' });
+				throw new TRPCError({
+					code: 'FORBIDDEN',
+					message: 'Admin password resets are disabled in Insight cloud.',
+				});
 			}
 
 			const account = await accountQueries.getAccountById(input.userId);

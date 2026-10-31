@@ -410,7 +410,7 @@ class TestInsightConfigPromptLLM:
     @patch("insight_core.config.llm.LLMConfig.promptConfig")
     def test_creates_llm_config(self, mock_prompt_config, mock_confirm):
         """Creates LLM config when configured."""
-        from insight_core.config import LLMConfig, LLMProvider, InsightConfig, ProviderConfig
+        from insight_core.config import InsightConfig, LLMConfig, LLMProvider, ProviderConfig
 
         mock_llm = LLMConfig(providers=[ProviderConfig(provider=LLMProvider.OPENAI, api_key="sk-test-key")])
         mock_prompt_config.return_value = mock_llm
@@ -606,7 +606,7 @@ class TestInitCommand:
     ):
         """Init command runs debug when config has LLM."""
         from insight_core.commands.init import init
-        from insight_core.config import LLMConfig, LLMProvider, InsightConfig, ProviderConfig
+        from insight_core.config import InsightConfig, LLMConfig, LLMProvider, ProviderConfig
 
         project_path = tmp_path / "test-project"
         project_path.mkdir()

@@ -27,8 +27,8 @@ export function MessagingProviderSystemPrompt({
 				<Block>
 					<Title level={2}>Insight Link</Title>
 					<Span>
-						This conversation is available on the Insight web app at: {chatUrl}. Do not proactively share this
-						link.
+						This conversation is available on the Insight web app at: {chatUrl}. Do not proactively share
+						this link.
 					</Span>
 				</Block>
 			)}

@@ -14,7 +14,7 @@ from pydantic import SecretStr
 
 from insight_core.commands.migrate.metabase_client import MetabaseClient
 from insight_core.commands.migrate.metabase_client import MetabaseError as MetabaseCliError
-from insight_core.config import MetabaseConfig, InsightConfig, InsightConfigError
+from insight_core.config import InsightConfig, InsightConfigError, MetabaseConfig
 from insight_core.tracking import track_command
 from insight_core.ui import UI, ask_text
 
