@@ -64,8 +64,9 @@ function SignUp() {
 	return (
 		<AuthForm
 			form={form}
-			title='Sign up'
-			submitText='Sign up'
+			title='Create your account'
+			description='Start asking questions of your data.'
+			submitText='Create account'
 			serverError={serverError}
 			displaySocialProviders={true}
 			socialCallbackUrl={safeRedirect ?? undefined}
@@ -75,23 +76,31 @@ function SignUp() {
 					<Link
 						to='/login'
 						search={{ error: undefined, redirect: safeRedirect ?? undefined }}
-						className='text-violet underline underline-offset-2'
+						className='font-medium text-foreground underline underline-offset-2'
 					>
 						Log in
 					</Link>
 				</>
 			}
 		>
-			<FormTextField form={form} name='name' title='Name' placeholder='Joe' className='mb-6' />
+			<FormTextField form={form} name='name' title='Name' placeholder='Your name' autoComplete='name' />
 			<FormTextField
 				form={form}
 				name='email'
 				type='email'
 				title='Email'
-				placeholder='joe@gmail.com'
-				className='mb-6'
+				placeholder='you@company.com'
+				autoComplete='email'
 			/>
-			<FormTextField form={form} name='password' type='password' title='Password' className='mb-10' />
+			<FormTextField
+				form={form}
+				name='password'
+				type='password'
+				title='Password'
+				autoComplete='new-password'
+				minLength={8}
+				hint='At least 8 characters.'
+			/>
 		</AuthForm>
 	);
 }

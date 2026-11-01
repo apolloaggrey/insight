@@ -1,5 +1,6 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { Palette } from 'lucide-react';
 import { useState } from 'react';
 import type { UserRole } from '@insight/shared/types';
 
@@ -13,10 +14,12 @@ import { UserProfileCard } from '@/components/settings/profile-card';
 import { useLocalStorage } from '@/hooks/use-local-storage';
 import { soundNotificationStorage } from '@/hooks/use-stream-end-sound';
 import { useToolCallDensity } from '@/hooks/use-tool-call-density';
+import { ThemeCustomizerSheet } from '@/components/settings/theme-customizer';
 import { ThemeSelector } from '@/components/settings/theme-selector';
 import { ToolCallDensitySetting } from '@/components/settings/tool-call-density-setting';
 import { DangerZone } from '@/components/settings/danger-zone';
 import { SettingsMemories } from '@/components/settings/memories';
+import { Button } from '@/components/ui/button';
 import { SettingsCard, SettingsPageWrapper } from '@/components/ui/settings-card';
 import { SettingsControlRow, SettingsToggleRow } from '@/components/ui/settings-toggle-row';
 import { trpc } from '@/main';
@@ -113,6 +116,19 @@ function GeneralPage() {
 							label='Theme'
 							description='Choose how Insight looks.'
 							control={<ThemeSelector />}
+						/>
+						<SettingsControlRow
+							label='Theme Customizer'
+							description='Presets, colors, fonts, layout and tooltips.'
+							control={
+								<ThemeCustomizerSheet
+									trigger={
+										<Button variant='outline' size='sm'>
+											<Palette /> Customize
+										</Button>
+									}
+								/>
+							}
 						/>
 					</SettingsCard>
 

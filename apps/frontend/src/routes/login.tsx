@@ -65,7 +65,8 @@ function Login() {
 	return (
 		<AuthForm
 			form={form}
-			title='Log in'
+			title='Welcome back'
+			description='Log in to your account to continue.'
 			submitText='Log in'
 			serverError={serverError}
 			displaySocialProviders={true}
@@ -79,7 +80,7 @@ function Login() {
 						<Link
 							to='/signup'
 							search={{ error: undefined, redirect: safeRedirect ?? undefined }}
-							className='text-violet underline underline-offset-2'
+							className='font-medium text-foreground underline underline-offset-2'
 						>
 							Create an account
 						</Link>
@@ -92,25 +93,23 @@ function Login() {
 				name='email'
 				type='email'
 				title='Email'
-				placeholder='joe@gmail.com'
-				className='mb-4'
+				placeholder='you@company.com'
+				autoComplete='email'
 			/>
 			<FormTextField
 				form={form}
 				name='password'
 				type='password'
 				title='Password'
-				className={isUserLoginEnabled && isSmtpSetup.data ? 'mb-2' : 'mb-8'}
+				autoComplete='current-password'
 			/>
 			{isUserLoginEnabled && isSmtpSetup.data && (
-				<div className='text-right mb-6'>
-					<Link
-						to='/forgot-password'
-						className='text-xs text-foreground font-medium underline underline-offset-2'
-					>
-						Forgot password
-					</Link>
-				</div>
+				<Link
+					to='/forgot-password'
+					className='self-end text-xs font-medium text-foreground underline underline-offset-2'
+				>
+					Forgot password?
+				</Link>
 			)}
 		</AuthForm>
 	);

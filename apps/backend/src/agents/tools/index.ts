@@ -14,6 +14,7 @@ import { isCustomStoriesEnabled } from '../../services/story-mount';
 import { AgentSettings } from '../../types/agent-settings';
 import clarification from './clarification';
 import displayChart from './display-chart';
+import displayInteractiveChart from './display-interactive-chart';
 import { createDisplayMapTool } from './display-map';
 import executePython from './execute-python';
 import executeSandboxedCode from './execute-sandboxed-code';
@@ -44,6 +45,7 @@ export const tools = {
 	story,
 	clarification,
 	display_chart: displayChart,
+	display_interactive_chart: displayInteractiveChart,
 	...(executePython && { execute_python: executePython }),
 	...(executeSandboxedCode && { execute_sandboxed_code: executeSandboxedCode }),
 	execute_sql: executeSql,

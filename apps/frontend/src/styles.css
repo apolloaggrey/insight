@@ -4,6 +4,7 @@ layer(base);
 @import 'tailwindcss';
 @import 'tw-animate-css';
 @import './styles.animations.css';
+@import './styles.theme-customizer.css';
 @import './styles.custom-story-thumbnail.css';
 @source "../../../node_modules/streamdown/dist/*.js";
 @source "../../../node_modules/@streamdown/math/dist/*.js";
@@ -123,7 +124,7 @@ html.insight-embed-app #app {
 
 body {
 	font-family:
-		'Geist',
+		var(--app-font, 'Geist'),
 		-apple-system,
 		BlinkMacSystemFont,
 		'Segoe UI',
@@ -201,8 +202,8 @@ code.dollar:before {
 	--color-sidebar-ring: var(--sidebar-ring);
 
 	--font-sans:
-		'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans',
-		'Droid Sans', 'Helvetica Neue', sans-serif;
+		var(--app-font, 'Geist'), -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu',
+		'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
 	--font-borna:
 		'Borna', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', 'Fira Sans',
 		'Droid Sans', 'Helvetica Neue', sans-serif;

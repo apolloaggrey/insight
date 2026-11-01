@@ -3,6 +3,7 @@ import { StoryToolCall } from './story';
 import { ClarificationToolCall } from './clarification';
 import { DefaultToolCall } from './default';
 import { DisplayChartToolCall } from './display-chart';
+import { DisplayInteractiveChartToolCall } from './display-interactive-chart';
 import { DisplayMapToolCall } from './display-map';
 import { ExecutePythonToolCall } from './execute-python';
 import { ExecuteSandboxedCodeToolCall } from './execute-sandboxed-code';
@@ -36,6 +37,7 @@ const toolComponents: Partial<{
 	story: StoryToolCall,
 	clarification: ClarificationToolCall,
 	display_chart: DisplayChartToolCall,
+	display_interactive_chart: DisplayInteractiveChartToolCall,
 	display_map: DisplayMapToolCall,
 	execute_python: ExecutePythonToolCall,
 	execute_sandboxed_code: ExecuteSandboxedCodeToolCall,

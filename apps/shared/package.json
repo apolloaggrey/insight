@@ -11,6 +11,7 @@
 		"./chart-tooltip": "./src/chart-tooltip.tsx",
 		"./chart-types": "./src/chart-types.ts",
 		"./chart-values": "./src/chart-values.ts",
+		"./interactive-chart": "./src/interactive-chart.ts",
 		"./color": "./src/color.ts",
 		"./context-recommendation": "./src/context-recommendation.ts",
 		"./date": "./src/date.ts",

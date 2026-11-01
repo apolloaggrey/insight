@@ -5,7 +5,7 @@ import { findInternalSkill, internalSkillNames, listInternalSkills } from '../sr
 import loadSkillTool from '../src/agents/tools/load-skill';
 
 const bodyOf = (name: string, canRunSandbox: boolean): string => {
-	return findInternalSkill(name)!.body({ canRunSandbox });
+	return findInternalSkill(name)!.body({ canRunSandbox, canRenderInteractiveCharts: true });
 };
 
 const runLoadSkill = async (name: string): Promise<{ name: string; body: string }> => {
@@ -25,14 +25,16 @@ describe('internal skill registry', () => {
 		for (const skill of listInternalSkills()) {
 			expect(skill.name).toMatch(/^[a-z0-9-]+$/);
 			expect(skill.description.length).toBeGreaterThan(20);
-			expect(skill.body({ canRunSandbox: true }).length).toBeGreaterThan(100);
-			expect(skill.body({ canRunSandbox: false }).length).toBeGreaterThan(100);
+			expect(skill.body({ canRunSandbox: true, canRenderInteractiveCharts: true }).length).toBeGreaterThan(100);
+			expect(skill.body({ canRunSandbox: false, canRenderInteractiveCharts: true }).length).toBeGreaterThan(100);
 		}
 	});
 
 	it('never mentions the sandbox in a run that has none', () => {
 		for (const skill of listInternalSkills()) {
-			expect(skill.body({ canRunSandbox: false })).not.toMatch(/sandbox|storage_files|save_files/i);
+			expect(skill.body({ canRunSandbox: false, canRenderInteractiveCharts: true })).not.toMatch(
+				/sandbox|storage_files|save_files/i,
+			);
 		}
 	});
 

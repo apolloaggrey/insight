@@ -1,0 +1,274 @@
+/* "Cards" = the <Card> component plus every hand-rolled card surface (bg-card + rounded + border).
+   Dashed drop zones and floating surfaces (shadow-lg and up) keep their own look. */
+html[data-card-style='flat'] [data-slot='card'],
+html[data-card-style='flat'] .shadow-xs,
+html[data-card-style='flat']
+	:is(.bg-card, [class*='bg-card/']):is(.rounded-lg, .rounded-xl, .rounded-2xl):is(.border, .border-2):not(
+		.border-dashed,
+		.shadow-lg,
+		.shadow-xl,
+		.shadow-2xl
+	):not(input, textarea, select, button) {
+	box-shadow: none;
+}
+html[data-card-style='flat'] [data-slot='card'],
+html[data-card-style='flat']
+	:is(.bg-card, [class*='bg-card/']):is(.rounded-lg, .rounded-xl, .rounded-2xl):is(.border, .border-2):not(
+		.border-dashed,
+		.shadow-lg,
+		.shadow-xl,
+		.shadow-2xl
+	):not(input, textarea, select, button) {
+	border-color: transparent;
+}
+html[data-card-style='elevated'] [data-slot='card'],
+html[data-card-style='elevated']
+	:is(.bg-card, [class*='bg-card/']):is(.rounded-lg, .rounded-xl, .rounded-2xl):is(.border, .border-2):not(
+		.border-dashed,
+		.shadow-lg,
+		.shadow-xl,
+		.shadow-2xl
+	):not(input, textarea, select, button) {
+	box-shadow:
+		0 1px 2px oklch(0 0 0 / 4%),
+		0 6px 18px -6px oklch(0 0 0 / 12%);
+	border-color: transparent;
+}
+
+html[data-motion='reduced'] *,
+html[data-motion='reduced'] *::before,
+html[data-motion='reduced'] *::after {
+	animation-duration: 0.001ms !important;
+	animation-iteration-count: 1 !important;
+	transition-duration: 0.001ms !important;
+	scroll-behavior: auto !important;
+}
+
+html[data-scrollbar='auto'],
+html[data-scrollbar='auto'] * {
+	scrollbar-width: auto;
+}
+
+/* Sidebar items use text-foreground and bg-accent, so a tinted or inverted sidebar re-points those tokens. */
+html:is([data-sidebar-color='tinted'], [data-sidebar-color='inverted']) [data-slot='app-sidebar'] {
+	--accent: var(--sidebar-accent);
+	--accent-foreground: var(--sidebar-accent-foreground);
+}
+html[data-sidebar-color='inverted'] [data-slot='app-sidebar'] {
+	color: var(--sidebar-foreground);
+	--foreground: var(--sidebar-foreground);
+	--muted-foreground: color-mix(in oklch, var(--sidebar-foreground) 65%, transparent);
+	--border: var(--sidebar-border);
+	--input: var(--sidebar-border);
+}
+
+html[data-nav-active='solid'] [data-slot='app-sidebar'] a[data-status='active']:not([data-slot='sidebar-user-menu'] a) {
+	background: var(--primary);
+	color: var(--primary-foreground);
+}
+html[data-nav-active='bar'] [data-slot='app-sidebar'] a[data-status='active']:not([data-slot='sidebar-user-menu'] a) {
+	background: transparent;
+	color: var(--primary);
+	border-radius: 0;
+	box-shadow: inset 3px 0 0 var(--primary);
+}
+html[data-nav-active='bar'][data-sidebar-side='right']
+	[data-slot='app-sidebar']
+	a[data-status='active']:not([data-slot='sidebar-user-menu'] a) {
+	box-shadow: inset -3px 0 0 var(--primary);
+}
+
+/* Style, size, animation and arrow are data attributes on <html> (data-tooltip-*). Each one only sets
+   --tt-* variables, so a swatch can preview a style by carrying its own data-tooltip-style. */
+@layer components {
+	:root {
+		--tooltip-max-w: 22rem;
+		--tt-shadow-base: 0 12px 32px -12px oklch(0 0 0 / 30%), 0 2px 8px -3px oklch(0 0 0 / 14%);
+		--tt-bg-image: none;
+		--tt-blur: none;
+		--tt-fs: 0.75rem;
+		--tt-py: 0.375rem;
+		--tt-px: 0.625rem;
+		--tt-radius: calc(var(--radius) * 0.8);
+		--tt-scale: 0.7;
+		--tt-dist: 6px;
+		--tt-dur: 280ms;
+		--tt-ease: cubic-bezier(0.34, 1.56, 0.64, 1);
+		--tt-bg: var(--popover);
+		--tt-fg: var(--popover-foreground);
+		--tt-border: var(--border);
+		--tt-arrow-bg: var(--popover);
+		--tt-shadow: var(--tt-shadow-base);
+	}
+	[data-tooltip-style='contrast'] {
+		--tt-bg: var(--foreground);
+		--tt-fg: var(--background);
+		--tt-border: transparent;
+		--tt-arrow-bg: var(--foreground);
+		--tt-shadow: 0 10px 30px -10px oklch(0 0 0 / 45%), 0 2px 6px -2px oklch(0 0 0 / 20%);
+		--tt-bg-image: none;
+		--tt-blur: none;
+	}
+	[data-tooltip-style='surface'] {
+		--tt-bg: var(--popover);
+		--tt-fg: var(--popover-foreground);
+		--tt-border: var(--border);
+		--tt-arrow-bg: var(--popover);
+		--tt-shadow: var(--tt-shadow-base);
+		--tt-bg-image: none;
+		--tt-blur: none;
+	}
+	[data-tooltip-style='glass'] {
+		--tt-bg: color-mix(in oklch, var(--popover) 66%, transparent);
+		--tt-fg: var(--popover-foreground);
+		--tt-border: color-mix(in oklch, var(--foreground) 14%, transparent);
+		--tt-arrow-bg: color-mix(in oklch, var(--popover) 66%, transparent);
+		--tt-shadow: inset 0 1px 0 oklch(1 0 0 / 22%), var(--tt-shadow-base);
+		--tt-bg-image: linear-gradient(160deg, oklch(1 0 0 / 14%), transparent 60%);
+		--tt-blur: blur(14px) saturate(1.8);
+	}
+	[data-tooltip-style='accent'] {
+		--tt-bg: var(--primary);
+		--tt-fg: var(--primary-foreground);
+		--tt-border: transparent;
+		--tt-arrow-bg: var(--primary);
+		--tt-shadow:
+			0 10px 28px -10px color-mix(in oklch, var(--primary) 75%, transparent), 0 2px 6px -2px oklch(0 0 0 / 15%);
+		--tt-bg-image: none;
+		--tt-blur: none;
+	}
+	[data-tooltip-style='gradient'] {
+		--tt-bg: var(--primary);
+		--tt-fg: var(--primary-foreground);
+		--tt-border: oklch(1 0 0 / 18%);
+		--tt-arrow-bg: oklch(from var(--primary) calc(l - 0.03) c calc(h + 24));
+		--tt-shadow:
+			inset 0 1px 0 oklch(1 0 0 / 25%), 0 12px 30px -10px color-mix(in oklch, var(--primary) 80%, transparent);
+		--tt-bg-image: linear-gradient(
+			135deg,
+			var(--primary),
+			oklch(from var(--primary) calc(l - 0.06) c calc(h + 48))
+		);
+		--tt-blur: none;
+	}
+
+	[data-tooltip-size='md'] {
+		--tt-fs: 0.8125rem;
+		--tt-py: 0.5rem;
+		--tt-px: 0.75rem;
+	}
+	[data-tooltip-size='lg'] {
+		--tt-fs: 0.875rem;
+		--tt-py: 0.625rem;
+		--tt-px: 0.9rem;
+		--tt-radius: var(--radius);
+	}
+
+	[data-tooltip-anim='fade'] {
+		--tt-scale: 1;
+		--tt-dist: 0px;
+		--tt-dur: 180ms;
+		--tt-ease: ease-out;
+	}
+	[data-tooltip-anim='scale'] {
+		--tt-scale: 0.92;
+		--tt-dist: 0px;
+		--tt-dur: 180ms;
+		--tt-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+	}
+	[data-tooltip-anim='slide'] {
+		--tt-scale: 1;
+		--tt-dist: 8px;
+		--tt-dur: 220ms;
+		--tt-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+	}
+
+	.app-tooltip {
+		position: relative;
+		max-width: var(--tooltip-max-w);
+		padding: var(--tt-py) var(--tt-px);
+		border: 1px solid var(--tt-border);
+		border-radius: var(--tt-radius);
+		background-color: var(--tt-bg);
+		background-image: var(--tt-bg-image);
+		color: var(--tt-fg);
+		box-shadow: var(--tt-shadow);
+		backdrop-filter: var(--tt-blur);
+		-webkit-backdrop-filter: var(--tt-blur);
+		font-size: var(--tt-fs);
+		font-weight: 500;
+		line-height: 1.45;
+		overflow-wrap: anywhere;
+	}
+	/* The side the bubble sits on decides which way slide and pop come in from. */
+	.app-tooltip[data-side='top'] {
+		--tt-dy: 1;
+	}
+	.app-tooltip[data-side='bottom'] {
+		--tt-dy: -1;
+	}
+	.app-tooltip[data-side='left'] {
+		--tt-dx: 1;
+	}
+	.app-tooltip[data-side='right'] {
+		--tt-dx: -1;
+	}
+	.app-tooltip-demo {
+		max-width: min(var(--tooltip-max-w), 100%);
+		transform-origin: 50% 100%;
+		animation: app-tooltip-enter var(--tt-dur) var(--tt-ease) both;
+	}
+
+	/* A rotated square whose outer half is clipped, so translucent styles don't double up where it overlaps the bubble. */
+	.app-tooltip-arrow {
+		position: absolute;
+		width: 10px;
+		height: 10px;
+		rotate: 45deg;
+		border-radius: 2px;
+		border: 0 solid var(--tt-border);
+		background: var(--tt-arrow-bg);
+		backdrop-filter: var(--tt-blur);
+		-webkit-backdrop-filter: var(--tt-blur);
+	}
+	.app-tooltip-arrow[data-side='top'] {
+		bottom: -6px;
+		border-width: 0 1px 1px 0;
+		clip-path: polygon(100% 0, 100% 100%, 0 100%);
+	}
+	.app-tooltip-arrow[data-side='bottom'] {
+		top: -6px;
+		border-width: 1px 0 0 1px;
+		clip-path: polygon(0 0, 100% 0, 0 100%);
+	}
+	html[data-tooltip-arrow='off'] .app-tooltip-arrow {
+		display: none;
+	}
+}
+
+.app-tooltip[data-state='delayed-open'],
+.app-tooltip[data-state='instant-open'] {
+	animation: app-tooltip-enter var(--tt-dur) var(--tt-ease) both;
+}
+.app-tooltip[data-state='instant-open'] {
+	animation-duration: 0s;
+}
+.app-tooltip[data-state='closed'] {
+	animation: app-tooltip-exit 120ms ease-in both;
+}
+@keyframes app-tooltip-enter {
+	from {
+		opacity: 0;
+		transform: translate(calc(var(--tt-dx, 0) * var(--tt-dist)), calc(var(--tt-dy, 0) * var(--tt-dist)))
+			scale(var(--tt-scale));
+	}
+}
+@keyframes app-tooltip-exit {
+	to {
+		opacity: 0;
+		transform: scale(var(--tt-scale));
+	}
+}
+.app-tooltip-svg-arrow {
+	fill: var(--tt-arrow-bg);
+}

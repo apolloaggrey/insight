@@ -1,5 +1,6 @@
 import { Link } from '@tanstack/react-router';
-import { ArrowLeft, SlidersVertical } from 'lucide-react';
+import { ArrowLeft, Palette, SlidersVertical } from 'lucide-react';
+import { ThemeCustomizerSheet } from './settings/theme-customizer';
 import { Avatar } from './ui/avatar';
 import { useSession } from '@/lib/auth-client';
 import { cn, hideIf } from '@/lib/utils';
@@ -15,7 +16,7 @@ export function SidebarUserMenu({ isCollapsed, isInSettings }: SidebarUserMenuPr
 	const email = session?.user?.email;
 
 	return (
-		<div className='flex flex-col gap-3'>
+		<div data-slot='sidebar-user-menu' className='flex flex-col gap-3'>
 			<div
 				className={cn(
 					'group/user flex items-center rounded-lg border-sidebar-border',
@@ -43,6 +44,19 @@ export function SidebarUserMenu({ isCollapsed, isInSettings }: SidebarUserMenuPr
 					</div>
 				</Link>
 				<div className={cn('flex items-center gap-2', isCollapsed ? 'p-2' : 'p-0.5')}>
+					{!isCollapsed && (
+						<ThemeCustomizerSheet
+							trigger={
+								<button
+									type='button'
+									aria-label='Theme customizer'
+									className='text-muted-foreground group-hover/user:text-foreground hover:text-foreground cursor-pointer'
+								>
+									<Palette className='size-4' />
+								</button>
+							}
+						/>
+					)}
 					{!isInSettings ? (
 						<Link
 							to='/settings'

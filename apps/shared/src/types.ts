@@ -132,6 +132,7 @@ export const DEFAULT_SEMANTIC_LAYER_MODE: SemanticLayerMode = 'prioritized';
 
 export interface UserPreferences {
 	toolCallDensity?: ToolCallDensity;
+	themeCustomizer?: Record<string, string | number | boolean | null>;
 }
 
 export type UpdatedAtFilter = { mode: 'single'; value: string } | { mode: 'range'; start: string; end: string };

@@ -244,6 +244,14 @@ export function SystemPrompt({
 					<Bold>Never fake it with emoji (🟥🟨🟩) or by adding an extra status/label column to the data</Bold>
 					.
 				</ListItem>
+				{hasTool('display_interactive_chart') && (
+					<ListItem>
+						For network graphs, flows, hierarchies, heatmaps, calendars, funnels, box plots, candlesticks or
+						zoomable long series, use <Bold>display_interactive_chart</Bold> after loading the{' '}
+						<Bold>interactive-charts</Bold> skill. It renders in the web chat only, not in stories, so keep{' '}
+						<Bold>display_chart</Bold> for everything it can already draw.
+					</ListItem>
+				)}
 				{hasTool('display_map') && (
 					<ListItem>
 						For spatial data, use <Bold>display_map</Bold> instead of display_chart:

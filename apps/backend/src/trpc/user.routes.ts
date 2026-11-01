@@ -113,6 +113,10 @@ export const userRoutes = {
 		.input(
 			z.object({
 				toolCallDensity: z.enum(TOOL_CALL_DENSITIES).optional(),
+				themeCustomizer: z
+					.record(z.string().max(64), z.union([z.string().max(64), z.number(), z.boolean(), z.null()]))
+					.refine((theme) => Object.keys(theme).length <= 100)
+					.optional(),
 			}),
 		)
 		.mutation(async ({ input, ctx }) => {

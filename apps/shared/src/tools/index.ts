@@ -1,5 +1,6 @@
 export * as clarification from './clarification';
 export * as displayChart from './display-chart';
+export * as displayInteractiveChart from './display-interactive-chart';
 export * as displayMap from './display-map';
 export * as executePython from './execute-python';
 export * as executeSandboxedCode from './execute-sandboxed-code';

@@ -26,5 +26,8 @@ export default createTool<loadSkill.Input, loadSkill.Output>({
 
 /** Mirrors how the tool set itself is assembled, so a skill only offers tools the run really has. */
 const skillCapabilities = (context: ToolContext | undefined): SkillCapabilities => {
-	return { canRunSandbox: isSandboxAvailable && context?.agentSettings?.experimental?.sandboxes === true };
+	return {
+		canRunSandbox: isSandboxAvailable && context?.agentSettings?.experimental?.sandboxes === true,
+		canRenderInteractiveCharts: context?.supportsCustomCharts === true,
+	};
 };

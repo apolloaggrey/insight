@@ -36,7 +36,7 @@ import { DEFAULT_USAGE_SEARCH } from '@/components/settings/usage-route-search';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useSidePanel } from '@/contexts/side-panel';
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard';
 import { useRecommendationCollapsed } from '@/hooks/use-recommendation-collapsed';
@@ -341,32 +341,30 @@ export function RecommendationCard({
 					</div>
 				</div>
 				<div className='flex h-[1lh] shrink-0 items-center gap-1'>
-					<TooltipProvider delayDuration={150}>
-						<Tooltip>
-							<TooltipTrigger asChild>
-								<Button
-									size='icon'
-									variant='ghost'
-									className={cn(
-										'size-6 rounded-full text-muted-foreground hover:text-foreground',
-										isFetchingPrompt && 'bg-accent disabled:opacity-100 dark:bg-accent/50',
-									)}
-									onClick={handleCopyPrompt}
-									disabled={isFetchingPrompt}
-								>
-									{isCopied ? (
-										<Check className='size-3.5' />
-									) : isFetchingPrompt ? (
-										<Loader2 className='size-3.5 animate-spin' />
-									) : (
-										<Copy className='size-3.5' />
-									)}
-									<span className='sr-only'>Copy prompt</span>
-								</Button>
-							</TooltipTrigger>
-							<TooltipContent>{isCopied ? 'Copied' : 'Copy prompt'}</TooltipContent>
-						</Tooltip>
-					</TooltipProvider>
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<Button
+								size='icon'
+								variant='ghost'
+								className={cn(
+									'size-6 rounded-full text-muted-foreground hover:text-foreground',
+									isFetchingPrompt && 'bg-accent disabled:opacity-100 dark:bg-accent/50',
+								)}
+								onClick={handleCopyPrompt}
+								disabled={isFetchingPrompt}
+							>
+								{isCopied ? (
+									<Check className='size-3.5' />
+								) : isFetchingPrompt ? (
+									<Loader2 className='size-3.5 animate-spin' />
+								) : (
+									<Copy className='size-3.5' />
+								)}
+								<span className='sr-only'>Copy prompt</span>
+							</Button>
+						</TooltipTrigger>
+						<TooltipContent>{isCopied ? 'Copied' : 'Copy prompt'}</TooltipContent>
+					</Tooltip>
 					<Badge
 						className={
 							CONTEXT_RECOMMENDATION_CATEGORY_BADGE_VARIANT[
@@ -379,7 +377,7 @@ export function RecommendationCard({
 				</div>
 				<div className='flex shrink-0 items-top gap-0.5'>
 					{!readOnly && (
-						<TooltipProvider delayDuration={150}>
+						<>
 							<Tooltip>
 								<TooltipTrigger asChild>
 									<Button
@@ -410,7 +408,7 @@ export function RecommendationCard({
 								</TooltipTrigger>
 								<TooltipContent>Mark applied</TooltipContent>
 							</Tooltip>
-						</TooltipProvider>
+						</>
 					)}
 				</div>
 			</div>
@@ -532,17 +530,15 @@ export function RecommendationCard({
 							!hasManualFix && !hasPatch && 'py-1.5',
 						)}
 					>
-						<TooltipProvider delayDuration={150}>
-							<Tooltip>
-								<TooltipTrigger asChild>
-									<span className='cursor-default'>Detected {createdAgo.humanReadable}</span>
-								</TooltipTrigger>
-								<TooltipContent>
-									{new Date(rec.createdAt).toLocaleString()}
-									{rec.llmModelId && <span aria-hidden> · {rec.llmModelId}</span>}
-								</TooltipContent>
-							</Tooltip>
-						</TooltipProvider>
+						<Tooltip>
+							<TooltipTrigger asChild>
+								<span className='cursor-default'>Detected {createdAgo.humanReadable}</span>
+							</TooltipTrigger>
+							<TooltipContent>
+								{new Date(rec.createdAt).toLocaleString()}
+								{rec.llmModelId && <span aria-hidden> · {rec.llmModelId}</span>}
+							</TooltipContent>
+						</Tooltip>
 					</div>
 					{(hasPatch || hasManualFix) && (
 						<div className='flex flex-wrap items-center gap-1.5 sm:ml-auto'>

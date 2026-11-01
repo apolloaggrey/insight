@@ -82,7 +82,14 @@ export const checkIsAgentRunning = (agent: Pick<UseChatHelpers<UIMessage>, 'stat
 
 /** Tools that should NOT be collapsed (important UI elements), per density setting. */
 const NON_COLLAPSIBLE_TOOLS_BY_DENSITY: Record<ToolCallDensity, (StaticToolName | DynamicToolName)[]> = {
-	compact: ['story', 'display_chart', 'display_map', 'suggest_follow_ups', 'clarification'],
+	compact: [
+		'story',
+		'display_chart',
+		'display_interactive_chart',
+		'display_map',
+		'suggest_follow_ups',
+		'clarification',
+	],
 	detailed: [
 		'story',
 		'task',
@@ -91,6 +98,7 @@ const NON_COLLAPSIBLE_TOOLS_BY_DENSITY: Record<ToolCallDensity, (StaticToolName 
 		'query_app_db',
 		'record_recommendation',
 		'display_chart',
+		'display_interactive_chart',
 		'display_map',
 		'suggest_follow_ups',
 		'clarification',

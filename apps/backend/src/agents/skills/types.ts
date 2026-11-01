@@ -22,4 +22,6 @@ export interface InternalSkill {
 export interface SkillCapabilities {
 	/** False when `execute_sandboxed_code` is not in the run's tool set, so pandas is not an option. */
 	canRunSandbox: boolean;
+	/** False outside the web chat, where nothing can draw `display_interactive_chart`. */
+	canRenderInteractiveCharts: boolean;
 }

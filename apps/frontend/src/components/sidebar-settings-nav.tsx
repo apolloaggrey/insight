@@ -3,6 +3,7 @@ import { ArrowUpRight, Search, X } from 'lucide-react';
 import { Fragment, useEffect, useRef, useState } from 'react';
 
 import { Badge } from '@/components/ui/badge';
+import { useThemeCustomizer } from '@/contexts/theme-customizer.provider';
 import { useSettingsSearch } from '@/hooks/use-settings-search';
 import { cn, hideIf } from '@/lib/utils';
 
@@ -193,6 +194,7 @@ export function SidebarSettingsNav({
 	const inputRef = useRef<HTMLInputElement>(null);
 	const [query, setQuery] = useState('');
 	const [isSearchFocused, setIsSearchFocused] = useState(false);
+	const { settings } = useThemeCustomizer();
 
 	const navContext: NavContext = {
 		isAdmin,
@@ -323,9 +325,11 @@ export function SidebarSettingsNav({
 					<nav className='flex flex-col px-2 gap-1'>
 						{navGroups.map((group) => (
 							<Fragment key={group.label}>
-								<div className='px-2 pt-4 pb-0.5 text-[11px] leading-4 font-medium uppercase tracking-wide text-muted-foreground'>
-									{group.label}
-								</div>
+								{settings.showGroupLabels && (
+									<div className='px-2 pt-4 pb-0.5 text-[11px] leading-4 font-medium uppercase tracking-wide text-muted-foreground'>
+										{group.label}
+									</div>
+								)}
 								{group.items.map((item) => {
 									const badge = item.badge ? (
 										<Badge

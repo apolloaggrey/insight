@@ -1,34 +1,32 @@
 import { useQuery } from '@tanstack/react-query';
-import { createContext, useContext, useEffect, useRef, useState } from 'react';
-import { Eye, EyeOff } from 'lucide-react';
+import { useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
+import { Mail } from 'lucide-react';
 import { trpc } from '../main';
-import { InputGroup } from './ui/input-group';
-import { NakedInput } from '@/components/ui/input';
+import type { SignInMethod } from '@/lib/last-sign-in-method';
+import { Input } from '@/components/ui/input';
 import { MicrosoftSignInButton, useIsMicrosoftSetup } from '@/components/auth-microsoft-button';
 import { OidcSignInButton } from '@/components/auth-oidc-button';
-import { Button, ChatButton, AuthSocialButton } from '@/components/ui/button';
+import { Button, AuthSocialButton } from '@/components/ui/button';
+import { ErrorMessage } from '@/components/ui/error-message';
 import { LastUsedPill } from '@/components/ui/last-used-pill';
+import { Spinner } from '@/components/ui/spinner';
 import { buildBrandVars, buildLastUsedPillVars } from '@/components/brand-color';
 import GithubIcon from '@/components/icons/github-icon.svg';
 import GitlabIcon from '@/components/icons/gitlab-icon.svg';
 import GoogleIcon from '@/components/icons/google-icon.svg';
 import InsightLogo from '@/components/icons/insight-full-logo.svg';
-import { BrandGradientBackdrop } from '@/components/brand-gradient-backdrop';
+import { AuthSignalField } from '@/components/auth-signal-field';
 import { useIsDarkMode } from '@/contexts/theme.provider';
 import { brandingAssetUrl, DEFAULT_BRAND_COLOR, useBranding } from '@/hooks/use-branding';
 import { handleGithubSignIn, handleGitlabSignIn, handleGoogleSignIn } from '@/lib/auth-client';
 import { loadLastSignInMethod, rememberSignInMethod } from '@/lib/last-sign-in-method';
 import { cn } from '@/lib/utils';
 
-/**
- * Shrinks the email/password fields when sign-in providers are on screen, so the
- * provider buttons read as the primary way in.
- */
-const CompactFieldsContext = createContext({ compact: false, emailLastUsed: false });
-
 interface AuthFormProps {
 	form: any;
 	title: string;
+	description?: string;
 	submitText: string;
 	children: React.ReactNode;
 	serverError?: string;
@@ -42,6 +40,7 @@ interface AuthFormProps {
 export function AuthForm({
 	form,
 	title,
+	description,
 	submitText,
 	children,
 	serverError,
@@ -51,249 +50,106 @@ export function AuthForm({
 	emailPasswordDisabledMessage,
 	footer,
 }: AuthFormProps) {
-	const isGoogleSetup = useQuery(trpc.authConfig.google.isSetup.queryOptions());
-	const isGithubSetup = useQuery(trpc.authConfig.github.isSetup.queryOptions());
-	const isGitlabSetup = useQuery(trpc.authConfig.gitlab.isSetup.queryOptions());
-	const { isSetup: isMicrosoftSetup, isPending: isMicrosoftSetupPending } = useIsMicrosoftSetup();
-	const oidcConfig = useQuery(trpc.authConfig.oidc.getConfig.queryOptions());
 	const branding = useBranding();
 	const isDark = useIsDarkMode();
 	const customColor = branding.enabled ? branding.brandColor : null;
 	const brandVars = customColor
 		? (buildBrandVars(customColor, isDark ? 'dark' : 'light') as React.CSSProperties)
 		: undefined;
+	const brandColor = customColor ?? DEFAULT_BRAND_COLOR;
+	const fieldColor = isDark ? `color-mix(in srgb, ${brandColor} 60%, white)` : brandColor;
 	const lastUsedPillVars = customColor ? (buildLastUsedPillVars(customColor) as React.CSSProperties) : undefined;
 
 	const [lastSignInMethod] = useState(loadLastSignInMethod);
 	const [isEmailFormExpanded, setIsEmailFormExpanded] = useState(lastSignInMethod === 'email');
+	const emailFormRef = useRef<HTMLFormElement>(null);
+	const { providerButtons, isPending: areProvidersLoading } = useProviderButtons(socialCallbackUrl, lastSignInMethod);
 
-	const socialProviders = [
-		isGoogleSetup.data && (
-			<AuthSocialButton
-				key='google'
-				icon={GoogleIcon}
-				label='Continue with Google'
-				onClick={() => {
-					rememberSignInMethod('google');
-					handleGoogleSignIn(socialCallbackUrl);
-				}}
-				lastUsed={lastSignInMethod === 'google'}
-			/>
-		),
-		isGithubSetup.data && (
-			<AuthSocialButton
-				key='github'
-				icon={GithubIcon}
-				label='Continue with GitHub'
-				onClick={() => {
-					rememberSignInMethod('github');
-					handleGithubSignIn(socialCallbackUrl);
-				}}
-				lastUsed={lastSignInMethod === 'github'}
-			/>
-		),
-		isGitlabSetup.data && (
-			<AuthSocialButton
-				key='gitlab'
-				icon={GitlabIcon}
-				label='Continue with GitLab'
-				onClick={() => {
-					rememberSignInMethod('gitlab');
-					handleGitlabSignIn(socialCallbackUrl);
-				}}
-				lastUsed={lastSignInMethod === 'gitlab'}
-			/>
-		),
-		isMicrosoftSetup && (
-			<MicrosoftSignInButton
-				key='microsoft'
-				callbackUrl={socialCallbackUrl}
-				lastUsed={lastSignInMethod === 'microsoft'}
-			/>
-		),
-		oidcConfig.data && (
-			<OidcSignInButton
-				key='oidc'
-				providerId={oidcConfig.data.providerId}
-				providerName={oidcConfig.data.providerName}
-				callbackUrl={socialCallbackUrl}
-				lastUsed={lastSignInMethod === 'oidc'}
-			/>
-		),
-	].filter(Boolean);
+	const areProvidersPending = Boolean(displaySocialProviders && areProvidersLoading);
+	const showsProviders = Boolean(displaySocialProviders && !areProvidersPending && providerButtons.length > 0);
+	const showEmailForm = !areProvidersPending && displayEmailPasswordForm && (!showsProviders || isEmailFormExpanded);
+	const showEmailDisabledMessage = !areProvidersPending && !displayEmailPasswordForm && emailPasswordDisabledMessage;
 
-	const areSocialProvidersPending = Boolean(
-		displaySocialProviders &&
-		(isGoogleSetup.isPending ||
-			isGithubSetup.isPending ||
-			isGitlabSetup.isPending ||
-			isMicrosoftSetupPending ||
-			oidcConfig.isPending),
-	);
-	const hasAnyProvider = socialProviders.length > 0;
-	const showsProviders = Boolean(displaySocialProviders && !areSocialProvidersPending && hasAnyProvider);
-	const showEmailForm =
-		!areSocialProvidersPending && displayEmailPasswordForm && (!showsProviders || isEmailFormExpanded);
+	const expandEmailForm = () => {
+		flushSync(() => setIsEmailFormExpanded(true));
+		emailFormRef.current?.querySelector('input')?.focus();
+	};
 
 	return (
-		<div className='flex min-h-screen w-full' style={lastUsedPillVars}>
-			<div className='flex w-full items-center justify-center lg:w-1/2'>
-				<div className='mx-auto w-full max-w-md p-8 my-auto gap-4'>
-					<div className='flex flex-col items-center start mb-10 pb-2 gap-8'>
-						{branding.enabled && branding.hasLogo ? (
-							<img
-								src={brandingAssetUrl('logo', branding.updatedAt)}
-								alt={branding.appName ?? 'Logo'}
-								className='h-10 w-auto max-w-[180px] object-contain'
-							/>
-						) : (
-							<InsightLogo
-								className={cn(
-									'w-20 h-auto text-foreground',
-									customColor && '[&_stop]:[stop-color:var(--brand-logo)]',
-								)}
-								style={
-									customColor ? ({ '--brand-logo': customColor } as React.CSSProperties) : undefined
-								}
-							/>
-						)}
-						<h1 className='font-borna text-2xl font-medium text-center'>{title}</h1>
+		<div className='relative flex min-h-screen w-full overflow-hidden' style={lastUsedPillVars}>
+			<AuthSignalField color={fieldColor} />
+			<div className='relative flex w-full items-center justify-center p-6 lg:w-1/2'>
+				<div className='flex w-full max-w-sm flex-col gap-8'>
+					<AuthLogo />
+
+					<div className='flex flex-col gap-2'>
+						<h1 className='font-borna text-3xl font-medium'>{title}</h1>
+						{description && <p className='text-sm text-muted-foreground'>{description}</p>}
 					</div>
 
-					{showsProviders && (
-						<div className='mb-6'>
-							<div className='grid grid-cols-1 gap-3 mb-6'>{socialProviders}</div>
+					<div className='flex flex-col gap-5'>
+						{serverError && (
+							<div role='alert'>
+								<ErrorMessage message={serverError} />
+							</div>
+						)}
 
-							{displayEmailPasswordForm && (
-								<div className='relative'>
-									<div className='absolute inset-0 flex items-center'>
-										<div className='w-full border-t' />
-									</div>
-									<div className='relative flex justify-center text-xs uppercase'>
-										<span className='px-2 bg-background text-foreground font-medium'>Or</span>
-									</div>
-								</div>
-							)}
+						{showsProviders && (
+							<div className='flex flex-col gap-3'>
+								{providerButtons}
+								{displayEmailPasswordForm && !isEmailFormExpanded && (
+									<Button
+										type='button'
+										variant='outline'
+										className='h-11 w-full gap-2.5 rounded-lg text-sm font-medium'
+										onClick={expandEmailForm}
+									>
+										<Mail className='size-4' />
+										Continue with email
+									</Button>
+								)}
+							</div>
+						)}
 
-							{displayEmailPasswordForm && !isEmailFormExpanded && (
-								<button
-									type='button'
-									onClick={() => setIsEmailFormExpanded(true)}
-									className='mt-6 flex w-full cursor-pointer items-center justify-center gap-2 text-sm font-medium text-foreground'
-								>
-									<span className='underline underline-offset-2'>Use email and password</span>
-								</button>
-							)}
-						</div>
-					)}
+						{showsProviders && showEmailForm && <AuthDivider />}
 
-					{serverError && <p className='text-red-500 text-center text-sm mb-4'>{serverError}</p>}
-
-					{showEmailForm ? (
-						<CompactFieldsContext.Provider
-							value={{
-								compact: showsProviders,
-								emailLastUsed: Boolean(displaySocialProviders && lastSignInMethod === 'email'),
-							}}
-						>
+						{showEmailForm && (
 							<form
+								ref={emailFormRef}
+								className='flex flex-col gap-4'
 								onSubmit={(e) => {
 									e.preventDefault();
 									form.handleSubmit();
 								}}
 							>
 								{children}
-
-								<form.Subscribe selector={(state: { canSubmit: boolean }) => state.canSubmit}>
-									{(canSubmit: boolean) => (
+								<form.Subscribe selector={(state: { isSubmitting: boolean }) => state.isSubmitting}>
+									{(isSubmitting: boolean) => (
 										<Button
 											type='submit'
-											variant={canSubmit ? 'primary-gradient' : 'default'}
-											className={cn(
-												'w-full rounded-full',
-												showsProviders ? 'h-10 text-sm' : 'h-11',
-												!canSubmit && 'bg-muted-foreground/20 text-secondary-foreground',
-											)}
-											style={canSubmit ? brandVars : undefined}
-											disabled={!canSubmit}
+											variant='primary-gradient'
+											className='relative mt-2 h-11 w-full gap-2 rounded-lg'
+											style={brandVars}
+											disabled={isSubmitting}
 										>
+											{isSubmitting && <Spinner />}
 											{submitText}
+											{displaySocialProviders && lastSignInMethod === 'email' && (
+												<LastUsedPill className='absolute -top-2 right-3' />
+											)}
 										</Button>
 									)}
 								</form.Subscribe>
 							</form>
-						</CompactFieldsContext.Provider>
-					) : (
-						!displayEmailPasswordForm &&
-						emailPasswordDisabledMessage && (
-							<p className='text-center text-sm text-muted-foreground'>{emailPasswordDisabledMessage}</p>
-						)
-					)}
+						)}
 
-					{footer && <div className='mt-6 text-center text-xs text-foreground font-medium'>{footer}</div>}
+						{showEmailDisabledMessage && (
+							<p className='text-sm text-muted-foreground'>{emailPasswordDisabledMessage}</p>
+						)}
+					</div>
+
+					{footer && <div className='text-sm text-muted-foreground'>{footer}</div>}
 				</div>
-			</div>
-			<AuthSidePanel />
-		</div>
-	);
-}
-
-function AuthSidePanel() {
-	const [value, setValue] = useState('');
-	const branding = useBranding();
-	const isDark = useIsDarkMode();
-	const customColor = branding.enabled ? branding.brandColor : null;
-	const panelRef = useRef<HTMLDivElement>(null);
-
-	useEffect(() => {
-		const el = panelRef.current;
-		if (!el) {
-			return;
-		}
-		if (!customColor) {
-			for (const key of Object.keys(buildBrandVars('#000000'))) {
-				el.style.removeProperty(key);
-			}
-			return;
-		}
-		const vars = buildBrandVars(customColor, isDark ? 'dark' : 'light');
-		for (const [key, val] of Object.entries(vars)) {
-			el.style.setProperty(key, val);
-		}
-	}, [customColor, isDark]);
-
-	return (
-		<div
-			ref={panelRef}
-			className='relative flex flex-col items-center justify-center hidden overflow-hidden lg:flex lg:w-1/2 m-4 rounded-lg'
-		>
-			<BrandGradientBackdrop
-				color={customColor ?? DEFAULT_BRAND_COLOR}
-				className='absolute inset-0 h-full w-full'
-			/>
-			<div className='relative w-full mx-auto max-w-md'>
-				<InputGroup
-					htmlFor='chat-input'
-					className={cn(
-						'flex items-center gap-1.5 md:gap-4 ml-auto relative rounded-lg px-4 py-6 shadow-xs',
-						'dark:bg-muted ring-[6px] ring-secondary/50 dark:ring-secondary/50',
-						'before:pointer-events-none before:absolute before:-inset-[7px] before:rounded-[15px] before:p-[0.5px]',
-						'before:[background:linear-gradient(135deg,rgba(255,255,255,0.95),rgba(255,255,255,0)_40%,rgba(255,255,255,0)_60%,rgba(255,255,255,0.55))]',
-						'dark:before:[background:linear-gradient(135deg,color-mix(in_srgb,var(--primary-foreground)_90%,transparent),transparent_40%,transparent_60%,color-mix(in_srgb,var(--primary-foreground)_50%,transparent))]',
-						'before:[-webkit-mask-image:linear-gradient(#fff_0_0),linear-gradient(#fff_0_0)] before:[mask-image:linear-gradient(#fff_0_0),linear-gradient(#fff_0_0)]',
-						'before:[-webkit-mask-clip:content-box,border-box] before:[mask-clip:content-box,border-box]',
-						'before:[-webkit-mask-composite:xor] before:[mask-composite:exclude]',
-					)}
-				>
-					<NakedInput
-						id='chat-input'
-						value={value}
-						onChange={(e) => setValue(e.target.value)}
-						placeholder='Ask anything about your data...'
-						className='flex-1 text-sm font-normal caret-primary placeholder:font-medium placeholder:text-muted-foreground'
-					/>
-					<ChatButton showStop={false} type='button' />
-				</InputGroup>
 			</div>
 		</div>
 	);
@@ -305,72 +161,153 @@ interface FormTextFieldProps {
 	type?: string;
 	title: string;
 	placeholder?: string;
-	className?: string;
+	autoComplete?: string;
+	minLength?: number;
+	hint?: string;
 }
 
-export function FormTextField({ form, name, type = 'text', title, placeholder, className }: FormTextFieldProps) {
-	const [showPassword, setShowPassword] = useState(false);
-	const { compact, emailLastUsed } = useContext(CompactFieldsContext);
-	const isPassword = type === 'password';
-	const inputType = isPassword && showPassword ? 'text' : type;
-	const eyeIconSize = compact ? 16 : 18;
-	const showLastUsed = emailLastUsed && name === 'email';
-
+export function FormTextField({
+	form,
+	name,
+	type = 'text',
+	title,
+	placeholder,
+	autoComplete,
+	minLength,
+	hint,
+}: FormTextFieldProps) {
 	return (
-		<form.Field
-			name={name}
-			validators={{
-				onMount: ({ value }: { value: string }) => (!value ? 'Required' : undefined),
-				onChange: ({ value }: { value: string }) => (!value ? 'Required' : undefined),
-			}}
-		>
+		<form.Field name={name}>
 			{(field: { state: { value: string }; handleChange: (v: string) => void; handleBlur: () => void }) => (
-				<div className={cn('grid', compact ? 'gap-1.5' : 'gap-2', className)}>
-					<label
-						htmlFor={name}
-						className={cn('font-medium text-foreground', compact ? 'text-xs' : 'text-sm')}
-					>
-						{title ?? name.charAt(0).toUpperCase() + name.slice(1)}
+				<div className='flex flex-col gap-1.5'>
+					<label htmlFor={name} className='text-sm font-medium text-foreground'>
+						{title}
 					</label>
-					<div className='relative'>
-						<NakedInput
-							name={name}
-							type={inputType}
-							placeholder={placeholder}
-							value={field.state.value}
-							onChange={(e) => field.handleChange(e.target.value)}
-							onBlur={field.handleBlur}
-							className={cn(
-								'bg-panel w-full rounded-lg',
-								compact ? 'h-10 text-sm px-3' : 'h-12 text-base p-4',
-								isPassword && (compact ? 'pr-10' : 'pr-12'),
-							)}
-						/>
-						{showLastUsed && <LastUsedPill className='absolute -top-2 right-3' />}
-						{isPassword && (
-							<button
-								type='button'
-								onClick={() => setShowPassword(!showPassword)}
-								className={cn(
-									'absolute top-1/2 -translate-y-1/2 text-foreground transition-colors',
-									compact ? 'right-3' : 'right-4',
-								)}
-								tabIndex={-1}
-								aria-label={showPassword ? 'Hide password' : 'Show password'}
-							>
-								{showPassword ? (
-									<EyeOff size={eyeIconSize} />
-								) : (
-									<Eye
-										size={eyeIconSize}
-										className='[&_circle]:fill-foreground [&_circle]:stroke-foreground'
-									/>
-								)}
-							</button>
-						)}
-					</div>
+					<Input
+						id={name}
+						name={name}
+						type={type}
+						placeholder={placeholder}
+						autoComplete={autoComplete}
+						minLength={minLength}
+						aria-describedby={hint ? `${name}-hint` : undefined}
+						required
+						value={field.state.value}
+						onChange={(e) => field.handleChange(e.target.value)}
+						onBlur={field.handleBlur}
+						className='h-11 rounded-lg'
+					/>
+					{hint && (
+						<p id={`${name}-hint`} className='text-xs text-muted-foreground'>
+							{hint}
+						</p>
+					)}
 				</div>
 			)}
 		</form.Field>
+	);
+}
+
+function useProviderButtons(callbackUrl: string | undefined, lastSignInMethod: SignInMethod | null) {
+	const isGoogleSetup = useQuery(trpc.authConfig.google.isSetup.queryOptions());
+	const isGithubSetup = useQuery(trpc.authConfig.github.isSetup.queryOptions());
+	const isGitlabSetup = useQuery(trpc.authConfig.gitlab.isSetup.queryOptions());
+	const { isSetup: isMicrosoftSetup, isPending: isMicrosoftSetupPending } = useIsMicrosoftSetup();
+	const oidcConfig = useQuery(trpc.authConfig.oidc.getConfig.queryOptions());
+
+	const providerButtons = [
+		isGoogleSetup.data && (
+			<AuthSocialButton
+				key='google'
+				icon={GoogleIcon}
+				label='Continue with Google'
+				onClick={() => {
+					rememberSignInMethod('google');
+					handleGoogleSignIn(callbackUrl);
+				}}
+				lastUsed={lastSignInMethod === 'google'}
+			/>
+		),
+		isGithubSetup.data && (
+			<AuthSocialButton
+				key='github'
+				icon={GithubIcon}
+				label='Continue with GitHub'
+				onClick={() => {
+					rememberSignInMethod('github');
+					handleGithubSignIn(callbackUrl);
+				}}
+				lastUsed={lastSignInMethod === 'github'}
+			/>
+		),
+		isGitlabSetup.data && (
+			<AuthSocialButton
+				key='gitlab'
+				icon={GitlabIcon}
+				label='Continue with GitLab'
+				onClick={() => {
+					rememberSignInMethod('gitlab');
+					handleGitlabSignIn(callbackUrl);
+				}}
+				lastUsed={lastSignInMethod === 'gitlab'}
+			/>
+		),
+		isMicrosoftSetup && (
+			<MicrosoftSignInButton
+				key='microsoft'
+				callbackUrl={callbackUrl}
+				lastUsed={lastSignInMethod === 'microsoft'}
+			/>
+		),
+		oidcConfig.data && (
+			<OidcSignInButton
+				key='oidc'
+				providerId={oidcConfig.data.providerId}
+				providerName={oidcConfig.data.providerName}
+				callbackUrl={callbackUrl}
+				lastUsed={lastSignInMethod === 'oidc'}
+			/>
+		),
+	].filter(Boolean);
+
+	const isPending =
+		isGoogleSetup.isPending ||
+		isGithubSetup.isPending ||
+		isGitlabSetup.isPending ||
+		isMicrosoftSetupPending ||
+		oidcConfig.isPending;
+
+	return { providerButtons, isPending };
+}
+
+function AuthLogo() {
+	const branding = useBranding();
+	const customColor = branding.enabled ? branding.brandColor : null;
+
+	if (branding.enabled && branding.hasLogo) {
+		return (
+			<img
+				src={brandingAssetUrl('logo', branding.updatedAt)}
+				alt={branding.appName ?? 'Logo'}
+				className='h-10 w-auto max-w-[180px] self-start object-contain'
+			/>
+		);
+	}
+
+	return (
+		<InsightLogo
+			className={cn('h-auto w-20 text-foreground', customColor && '[&_stop]:[stop-color:var(--brand-logo)]')}
+			style={customColor ? ({ '--brand-logo': customColor } as React.CSSProperties) : undefined}
+		/>
+	);
+}
+
+function AuthDivider() {
+	return (
+		<div className='flex items-center gap-3 text-xs text-muted-foreground'>
+			<div className='flex-1 border-t' />
+			or
+			<div className='flex-1 border-t' />
+		</div>
 	);
 }

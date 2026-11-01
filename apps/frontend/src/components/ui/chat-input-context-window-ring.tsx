@@ -61,7 +61,7 @@ export function ContextWindowRingView({
 	const tooltipText = buildTooltipText({ percent: clamped, tokensUsed, contextWindow });
 
 	return (
-		<Tooltip delayDuration={200}>
+		<Tooltip>
 			<TooltipTrigger asChild>
 				<span
 					tabIndex={0}

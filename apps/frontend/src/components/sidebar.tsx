@@ -9,7 +9,7 @@ import {
 	SearchIcon,
 	X,
 } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ProjectSwitcher } from './project-selector';
 import { ChatFilterMenu } from './sidebar-chat-filter-menu';
 import { ChatListItem } from './sidebar-chat-list-item';
@@ -25,6 +25,7 @@ import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useCommandMenuCallback } from '@/contexts/command-menu-callback';
 import { useSidebar } from '@/contexts/sidebar';
+import { useThemeCustomizer } from '@/contexts/theme-customizer.provider';
 import { brandingAssetUrl, useBranding } from '@/hooks/use-branding';
 import { useChatViewPreferences } from '@/hooks/use-chat-view-preferences';
 import { useIsCloud } from '@/hooks/use-insight-mode';
@@ -45,6 +46,10 @@ export function Sidebar() {
 	const matchRoute = useMatchRoute();
 	const { isCollapsed, isMobile, isMobileOpen, closeMobile, toggle: toggleSidebar } = useSidebar();
 	const [toggleHintOpen, setToggleHintOpen] = useState(false);
+	const [isResizing, setIsResizing] = useState(false);
+	const { settings } = useThemeCustomizer();
+	const isRightSide = settings.sidebarSide === 'right';
+	const showFooter = settings.showSidebarFooter || !settings.showTopBar;
 	const { fire: openCommandMenu } = useCommandMenuCallback();
 	const project = useQuery(trpc.project.getCurrent.queryOptions());
 	const projects = useQuery(trpc.project.listForCurrentUser.queryOptions());
@@ -127,16 +132,28 @@ export function Sidebar() {
 
 	const sidebarContent = (
 		<div
+			data-slot='app-sidebar'
 			className={cn(
-				'flex flex-col h-full overflow-hidden bg-sidebar dark:bg-background',
+				'relative flex flex-col h-full shrink-0 overflow-hidden bg-sidebar',
+				settings.sidebarColor === 'default' && 'dark:bg-background',
 				isMobile
 					? 'w-72'
 					: cn(
-							'border-r border-sidebar-border transition-[width,background-color] duration-300',
-							effectiveIsCollapsed ? 'w-13' : 'w-72',
+							'border-sidebar-border transition-[width,background-color] duration-300',
+							isResizing && 'transition-none',
+							effectiveIsCollapsed ? 'w-13' : 'w-(--app-sidebar-width)',
+							settings.sidebarVariant === 'sidebar' && (isRightSide ? 'border-l' : 'border-r'),
+							settings.sidebarVariant === 'floating' &&
+								'm-2 h-[calc(100%-1rem)] rounded-xl border shadow-md',
+							effectiveIsCollapsed &&
+								settings.sidebarCollapsible === 'offcanvas' &&
+								'm-0 w-0 border-0 shadow-none',
 						),
 			)}
 		>
+			{!isMobile && !effectiveIsCollapsed && (
+				<SidebarResizeHandle isRightSide={isRightSide} onResizingChange={setIsResizing} />
+			)}
 			<div className='p-2 flex flex-col'>
 				<div className='flex items-center relative'>
 					<button
@@ -185,14 +202,14 @@ export function Sidebar() {
 										className='text-muted-foreground'
 										aria-label='Toggle sidebar'
 									>
-										{effectiveIsCollapsed ? (
+										{effectiveIsCollapsed !== isRightSide ? (
 											<ArrowRightToLine className='size-4' />
 										) : (
 											<ArrowLeftFromLine className='size-4' />
 										)}
 									</Button>
 								</TooltipTrigger>
-								<TooltipContent side='right'>
+								<TooltipContent side={isRightSide ? 'left' : 'right'}>
 									<span className='flex items-center gap-2'>
 										Toggle sidebar
 										<kbd className='text-[10px] opacity-60 font-sans'>
@@ -285,11 +302,13 @@ export function Sidebar() {
 				</>
 			)}
 
-			{!isInSettings && <div className='border-b border-sidebar-border mx-2'></div>}
+			{!isInSettings && showFooter && <div className='border-b border-sidebar-border mx-2'></div>}
 
-			<div className={cn('mt-auto transition-[padding] duration-300', effectiveIsCollapsed ? 'p-1' : 'p-2')}>
-				<SidebarUserMenu isCollapsed={effectiveIsCollapsed} isInSettings={!!isInSettings} />
-			</div>
+			{showFooter && (
+				<div className={cn('mt-auto transition-[padding] duration-300', effectiveIsCollapsed ? 'p-1' : 'p-2')}>
+					<SidebarUserMenu isCollapsed={effectiveIsCollapsed} isInSettings={!!isInSettings} />
+				</div>
+			)}
 		</div>
 	);
 
@@ -297,12 +316,19 @@ export function Sidebar() {
 		return (
 			<>
 				{isMobileOpen && (
-					<div className='fixed inset-0 z-40 flex'>
+					<div className={cn('fixed inset-0 z-40 flex', isRightSide && 'justify-end')}>
 						<div
 							className='fixed inset-0 bg-black/50 animate-in fade-in duration-200'
 							onClick={closeMobile}
 						/>
-						<div className='relative z-50 animate-in slide-in-from-left duration-200'>{sidebarContent}</div>
+						<div
+							className={cn(
+								'relative z-50 animate-in duration-200',
+								isRightSide ? 'slide-in-from-right' : 'slide-in-from-left',
+							)}
+						>
+							{sidebarContent}
+						</div>
 					</div>
 				)}
 			</>
@@ -310,6 +336,63 @@ export function Sidebar() {
 	}
 
 	return sidebarContent;
+}
+
+const SIDEBAR_MIN_WIDTH_PX = 200;
+const SIDEBAR_MAX_WIDTH_PX = 480;
+const SIDEBAR_KEYBOARD_STEP_PX = 16;
+
+/** Drag the sidebar's inner edge to resize it; double-click returns to the chosen width preset. */
+function SidebarResizeHandle({
+	isRightSide,
+	onResizingChange,
+}: {
+	isRightSide: boolean;
+	onResizingChange: (isResizing: boolean) => void;
+}) {
+	const { update } = useThemeCustomizer();
+	const handle = useRef<HTMLDivElement>(null);
+	const clampWidth = (width: number) =>
+		Math.round(Math.min(SIDEBAR_MAX_WIDTH_PX, Math.max(SIDEBAR_MIN_WIDTH_PX, width)));
+	const sidebarRect = () => handle.current?.parentElement?.getBoundingClientRect();
+
+	return (
+		<div
+			ref={handle}
+			role='separator'
+			aria-label='Resize sidebar'
+			aria-orientation='vertical'
+			tabIndex={0}
+			className={cn(
+				'absolute inset-y-0 z-20 w-1 cursor-col-resize touch-none transition-colors hover:bg-primary/30 focus-visible:bg-primary/30 focus-visible:outline-none',
+				isRightSide ? 'left-0' : 'right-0',
+			)}
+			onPointerDown={(event) => {
+				event.currentTarget.setPointerCapture(event.pointerId);
+				onResizingChange(true);
+			}}
+			onPointerMove={(event) => {
+				const rect = sidebarRect();
+				if (!rect || !event.currentTarget.hasPointerCapture(event.pointerId)) {
+					return;
+				}
+				const width = isRightSide ? rect.right - event.clientX : event.clientX - rect.left;
+				update({ sidebarWidthPx: clampWidth(width) });
+			}}
+			onPointerUp={() => onResizingChange(false)}
+			onPointerCancel={() => onResizingChange(false)}
+			onDoubleClick={() => update({ sidebarWidthPx: null })}
+			onKeyDown={(event) => {
+				const rect = sidebarRect();
+				if (!rect || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) {
+					return;
+				}
+				const growsSidebar = (event.key === 'ArrowRight') !== isRightSide;
+				const delta = growsSidebar ? SIDEBAR_KEYBOARD_STEP_PX : -SIDEBAR_KEYBOARD_STEP_PX;
+				update({ sidebarWidthPx: clampWidth(rect.width + delta) });
+			}}
+		/>
+	);
 }
 
 function SidebarMenuButton({
@@ -547,6 +630,8 @@ const GROUP_INITIAL_COUNT = 10;
 
 function GroupSection({ group, groupBy }: { group: ChatGroup; groupBy: ChatGroupBy }) {
 	const { isOpen, toggle } = useSidebarSectionOpen(`section:chat-group:${group.label}`);
+	const { settings } = useThemeCustomizer();
+	const showLabel = !!group.label && settings.showGroupLabels;
 	const [expanded, setExpanded] = useState(false);
 	const hasMore = group.chats.length > GROUP_INITIAL_COUNT;
 	const visibleChats = expanded ? group.chats : group.chats.slice(0, GROUP_INITIAL_COUNT);
@@ -555,11 +640,11 @@ function GroupSection({ group, groupBy }: { group: ChatGroup; groupBy: ChatGroup
 		return null;
 	}
 
-	const showChats = group.label ? isOpen : true;
+	const showChats = showLabel ? isOpen : true;
 
 	return (
 		<>
-			{group.label && (
+			{group.label && showLabel && (
 				<div className='px-2'>
 					<SidebarSectionHeader label={group.label} isOpen={isOpen} onToggle={toggle} />
 				</div>

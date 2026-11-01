@@ -371,7 +371,7 @@ function IntegrationResultIcon({ result }: { result: AutomationRun['integrationR
 		);
 
 	return (
-		<Tooltip delayDuration={150}>
+		<Tooltip>
 			<TooltipTrigger asChild>{trigger}</TooltipTrigger>
 			<TooltipContent>
 				{result.ok ? `${config.label} sent successfully` : result.message || `${config.label} has failed`}

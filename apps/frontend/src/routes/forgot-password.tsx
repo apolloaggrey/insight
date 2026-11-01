@@ -60,18 +60,16 @@ function ForgotPassword() {
 				name='email'
 				type='email'
 				title='Email'
-				placeholder='joe@gmail.com'
-				className='mb-2'
+				placeholder='you@company.com'
+				autoComplete='email'
 			/>
-			<div className='text-right mb-8'>
-				<Link
-					to='/login'
-					search={{ error: undefined, redirect: undefined }}
-					className='text-xs text-foreground font-medium underline underline-offset-2'
-				>
-					Back to login
-				</Link>
-			</div>
+			<Link
+				to='/login'
+				search={{ error: undefined, redirect: undefined }}
+				className='self-end text-xs text-foreground font-medium underline underline-offset-2'
+			>
+				Back to login
+			</Link>
 		</AuthForm>
 	);
 }

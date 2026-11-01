@@ -10,8 +10,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import superjson from 'superjson';
 import { PostHogProvider } from './contexts/posthog.provider';
 import { ThemeProvider } from './contexts/theme.provider';
+import { ThemeCustomizerProvider } from './contexts/theme-customizer.provider';
 import { McpProvider } from './contexts/mcp';
-import { TooltipProvider } from './components/ui/tooltip';
 import { clearStaleActiveOrganization, getActiveOrganizationId } from './lib/active-organization';
 import { getActiveProjectId } from './lib/active-project';
 import { routeTree } from './routeTree.gen';
@@ -125,9 +125,9 @@ if (!rootElement.innerHTML) {
 				<QueryClientProvider client={queryClient}>
 					<McpProvider>
 						<PostHogProvider>
-							<TooltipProvider>
+							<ThemeCustomizerProvider>
 								<RouterProvider router={router} />
-							</TooltipProvider>
+							</ThemeCustomizerProvider>
 						</PostHogProvider>
 					</McpProvider>
 				</QueryClientProvider>

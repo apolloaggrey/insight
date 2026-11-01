@@ -59,13 +59,19 @@ function ResetPassword() {
 
 	return (
 		<AuthForm form={form} title='Reset password' submitText='Set new password' serverError={serverError}>
-			<FormTextField form={form} name='newPassword' type='password' title='New password' className='mb-6' />
+			<FormTextField
+				form={form}
+				name='newPassword'
+				type='password'
+				title='New password'
+				autoComplete='new-password'
+			/>
 			<FormTextField
 				form={form}
 				name='confirmPassword'
 				type='password'
 				title='Confirm new password'
-				className='mb-10'
+				autoComplete='new-password'
 			/>
 		</AuthForm>
 	);
