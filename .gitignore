@@ -29,6 +29,13 @@ apps/backend/storage/
 
 example/tests/outputs/
 
+# Local project data written by Insight (schemas, previews, connection details)
+example/insight_connections.yaml
+example/databases/
+example/repos/
+example/semantics/
+example/docs/
+
 # heal.dev related stuff
 .heal/
 apps/frontend/.playwright*
